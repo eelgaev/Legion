@@ -569,6 +569,12 @@ impl Context {
         }
     }
 
+    /// Whether this context's graph was allocated from `allocator`
+    /// ([`Self::alloc_graph_shared`]).
+    pub fn shares(&self, allocator: &SharedAllocator) -> bool {
+        matches!(&*self.allocator.borrow(), Some(Alloc::Shared(a)) if std::sync::Arc::ptr_eq(a, allocator))
+    }
+
     /// Ends this context and returns its compute allocator (with its grown buffer) for reuse;
     /// `None` for a shared one ([`Self::alloc_graph_shared`]).
     pub fn into_allocator(self) -> Option<ComputeAllocator> {
@@ -1530,6 +1536,11 @@ impl KeptGraph {
             raw: self.tensors[i],
             _ctx: PhantomData,
         }
+    }
+
+    /// Whether the graph was allocated from `allocator` ([`Context::alloc_graph_shared`]).
+    pub fn shares(&self, allocator: &SharedAllocator) -> bool {
+        self.ctx.shares(allocator)
     }
 
     /// Ends the graph and returns its compute allocator for reuse.

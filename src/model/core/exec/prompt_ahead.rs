@@ -141,10 +141,15 @@ impl Executor {
         };
         let kept = self.stages[s].mixed.remove(i);
         self.mixed_aside = 1;
+        // Where the kept prompt graphs share two buffers (#836): the next one goes into the
+        // other one than the running graph's, which stays as it is.
+        let st = &mut self.stages[s];
+        st.lane_running = st.lane_of(&kept.1);
         super::verify_ahead::set_building_ahead(true);
         let r = self.build_kept(s, next);
         super::verify_ahead::set_building_ahead(false);
         self.mixed_aside = 0;
+        self.stages[s].lane_running = None;
         self.stages[s].mixed.push(kept);
         if let Err(e) = r {
             tracing::debug!(stage = s, error = %e, "prompt graph built ahead: failed");

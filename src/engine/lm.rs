@@ -3839,6 +3839,9 @@ struct LoadFacts<'a> {
     compute: &'a [usize],
     /// Whether the KV fit charged chunked step scores ([`paged_step_scores`]).
     chunked_scores: bool,
+    /// Whether the KV fit charged the kept prompt graphs' shared buffers
+    /// ([`crate::model::core::prompt_buffers`], #836).
+    prompt_buffers_shared: bool,
     /// The GPU vision tower's largest image's scratch (0 without one), as the KV fit kept it.
     vision_scratch: usize,
     ngram: Option<report::NgramPlacement>,
@@ -3864,7 +3867,8 @@ fn load_report(
     let kv = exec.kv_stage_bytes();
     let host_blocks = f.n_blocks - f.hbm_blocks;
     let gpu = layout.stages[0].0.is_some();
-    let prompt_graphs = exec.prompt_graphs();
+    let prompt_graphs =
+        crate::model::core::prompt_buffers(exec.prompt_graphs(), f.prompt_buffers_shared);
     let chunked = f.chunked_scores;
     let mut stages: Vec<report::StageMemory> = layout
         .stages
@@ -4957,6 +4961,16 @@ impl LmEngine {
         // ([`paged_step_scores`]), which scores the whole group.
         let chunked =
             paged_step_scores(cfg.tp, paged) && hp.arch.chunks_step_scores(&hp, LEAN_STEP_TOKENS);
+        // One GPU sharing the host's memory keeps its kept prompt graphs in two shared compute
+        // buffers (#836, [`crate::model::core::prompt_buffers`]): the fits charge those. Not
+        // with an expert cache, whose lends drop them (its graphs then take a buffer each).
+        let buffers_shared = shared
+            && mode != ExpertMode::Cache
+            && layout.stages.len() == 1
+            && cfg.tp <= 1
+            && cfg.tp_pair.is_none()
+            && crate::model::core::prompt_buffer_reserve();
+        let charged = |kept: usize| crate::model::core::prompt_buffers(kept, buffers_shared);
         // `kept`: the prompt graphs each stage keeps ([`lean_prompt_graphs`]).
         let fit_with = |ring: Option<KvRing>, log: bool, kept: usize| {
             layout
@@ -4970,7 +4984,7 @@ impl LmEngine {
                         dev.kind(),
                         cfg.max_batch_tokens,
                         cfg.uma_free,
-                        kept,
+                        charged(kept),
                         chunked,
                     ) + tower_kv_reserve(mode, dev.kind(), si, early_scratch);
                     let free = layout.free_for_split(si, 0);
@@ -5170,7 +5184,7 @@ impl LmEngine {
                     dev.kind(),
                     cfg.max_batch_tokens,
                     cfg.uma_free,
-                    prompt_graphs,
+                    charged(prompt_graphs),
                     chunked,
                 ) + pair_head_pool;
                 let spill = state_spill(
@@ -5974,6 +5988,8 @@ impl LmEngine {
                     n_past,
                     buffers = ?reserved.iter().map(|r| r.0).collect::<Vec<_>>(),
                     mib_each = ?reserved.iter().map(|r| r.1 >> 20).collect::<Vec<_>>(),
+                    // Fewer buffers than kept graphs: the graphs share them (#836).
+                    kept_graphs = prompt_graphs,
                     charged_mib_each = ?charged.map(|b| b >> 20),
                     chunked_scores = chunked && cfg.max_batch_tokens > LEAN_STEP_TOKENS,
                     seconds = t_reserve.elapsed().as_secs_f64(),
@@ -6171,6 +6187,7 @@ impl LmEngine {
                 state_bytes: &stage_state_bytes,
                 compute: &measured_compute,
                 chunked_scores: chunked,
+                prompt_buffers_shared: buffers_shared,
                 vision_scratch,
                 ngram,
                 engram,

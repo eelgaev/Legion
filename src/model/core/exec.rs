@@ -77,6 +77,8 @@ pub use mtp_graphs::set_kept as set_mtp_kept_graphs;
 pub use prompt_ahead::PromptNext;
 pub use prompt_ahead::set_enabled as set_prompt_build_ahead;
 pub use prompt_stats::set_logging as set_prompt_step_stats;
+pub use ready_buffers::enabled as prompt_buffer_reserve;
+pub use ready_buffers::prompt_buffers;
 pub use ready_buffers::set_enabled as set_prompt_buffer_reserve;
 pub use remote::{Remote, from_wire, from_wire_with};
 pub use tp_lead::TpLead;
@@ -148,6 +150,12 @@ struct Stage {
     /// Compute buffers allocated at load for the kept prompt graphs, taken where a prompt
     /// graph would start a new allocator ([`ready_buffers`]).
     ready: Vec<ComputeAllocator>,
+    /// The reserved compute buffers the kept prompt graphs share instead (#836,
+    /// [`ready_buffers`]): each new prompt graph is allocated from one of them.
+    lanes: Vec<SharedAllocator>,
+    /// While a prompt graph is built beside the running one ([`prompt_ahead`]): the lane the
+    /// running graph is in, which the build must not plan or grow.
+    lane_running: Option<usize>,
     backend: Backend,
 }
 
@@ -187,8 +195,32 @@ impl Stage {
             flow_io_b: PinnedIo::default(),
             spare: None,
             ready: Vec::new(),
+            lanes: Vec::new(),
+            lane_running: None,
             layers,
             backend,
+        })
+    }
+
+    /// The lane (index into `lanes`) kept graph `g` was allocated from, if any.
+    fn lane_of(&self, g: &KeptGraph) -> Option<usize> {
+        self.lanes.iter().position(|a| g.shares(a))
+    }
+
+    /// The lane a new prompt graph goes into: not the running graph's while one is built beside
+    /// it, else not the most recent prompt graph's. `None` without lanes.
+    fn pick_lane(&self) -> Option<usize> {
+        if self.lanes.len() < ready_buffers::PROMPT_BUFFERS {
+            return None;
+        }
+        let busy = self.lane_running.or_else(|| {
+            (self.mixed.iter().rev())
+                .filter(|(s, _)| !verify_kept::is_verify(s))
+                .find_map(|(_, g)| self.lane_of(g))
+        });
+        Some(match busy {
+            Some(b) => (b + 1) % self.lanes.len(),
+            None => 0,
         })
     }
 
@@ -363,6 +395,11 @@ fn as_bytes_f32(values: &[f32]) -> &[u8] {
 }
 
 type Kept = (Vec<GroupShape>, KeptGraph);
+
+/// Drops the kept graphs of `kept` allocated from `lane` (its buffer moved or was freed).
+fn drop_lane(kept: &mut Vec<Kept>, lane: &SharedAllocator) {
+    kept.retain(|(_, g)| !g.shares(lane));
+}
 
 fn kept_in<'k>(
     decode: &'k [Kept],
@@ -1435,6 +1472,7 @@ impl Executor {
         crate::ggml::set_plan_report(false);
         let sizes = sizes?;
         let mut out = Vec::with_capacity(self.stages.len());
+        let one = self.stages.len() == 1;
         for (s, st) in self.stages.iter_mut().enumerate() {
             let bytes = sizes.get(s).copied().unwrap_or(0);
             let buft = st.backend.buffer_type();
@@ -1459,6 +1497,12 @@ impl Executor {
                 }
             }
             out.push((st.ready.len(), if wanted[s] > 0 { bytes } else { 0 }));
+            // Shared by the kept prompt graphs, each planned afresh (#836).
+            if ready_buffers::shared(one, st.ready.len()) {
+                st.lanes = (st.ready.drain(..))
+                    .map(|a| std::sync::Arc::new(std::sync::Mutex::new(a.with_fresh_plans(true))))
+                    .collect();
+            }
         }
         Ok(out)
     }
@@ -1487,11 +1531,12 @@ impl Executor {
         // The buffers reserved for the kept prompt graphs stay out of a measurement (its
         // graphs are dropped, and their buffers with them).
         let ready: Vec<_> = (self.stages.iter_mut())
-            .map(|s| std::mem::take(&mut s.ready))
+            .map(|s| (std::mem::take(&mut s.ready), std::mem::take(&mut s.lanes)))
             .collect();
         let out = self.measure_groups_now(parts);
-        for (s, r) in self.stages.iter_mut().zip(ready) {
+        for (s, (r, l)) in self.stages.iter_mut().zip(ready) {
             s.ready = r;
+            s.lanes = l;
         }
         out
     }
@@ -1658,11 +1703,17 @@ impl Executor {
                 .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).buffer_size())
                 .sum()
         } else {
+            // The lanes once (#836), the graphs in them not again.
+            let lanes: usize = (st.lanes.iter())
+                .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).buffer_size())
+                .sum();
             st.decode
                 .iter()
                 .chain(&st.mixed)
+                .filter(|(_, k)| st.lane_of(k).is_none())
                 .map(|(_, k)| k.allocator_size())
-                .sum()
+                .sum::<usize>()
+                + lanes
         };
         let piped = st.piped_shared.as_ref().map_or(0, |a| {
             a.lock().unwrap_or_else(|e| e.into_inner()).buffer_size()
@@ -4056,9 +4107,14 @@ impl Executor {
                 })
                 .clone()
         });
-        let allocator = match shared {
-            Some(_) => None,
-            None => Some(
+        // A prompt graph where the kept prompt graphs share the reserved buffers (#836): the
+        // lane it goes into ([`Stage::pick_lane`]).
+        let mut lane = (!meta && !lent && !decode && !verify_kept::is_verify(shape))
+            .then(|| stage.pick_lane())
+            .flatten();
+        let allocator = match (&shared, lane) {
+            (Some(_), _) | (None, Some(_)) => None,
+            (None, None) => Some(
                 old.and_then(|(_, g)| g.into_allocator())
                     .filter(|a| same_memory(a.base_type(), buft))
                     // The first graph after an expert-cache restore: the buffer kept for it.
@@ -4090,7 +4146,10 @@ impl Executor {
             ),
         };
         let mut allocator = allocator;
-        let before = allocator.as_ref().map_or(0, ComputeAllocator::buffer_size);
+        let before = match lane {
+            Some(l) => (stage.lanes[l].lock().unwrap_or_else(|e| e.into_inner())).buffer_size(),
+            None => allocator.as_ref().map_or(0, ComputeAllocator::buffer_size),
+        };
         let t_build = std::time::Instant::now();
         // Out of memory with other graphs kept: once more without them (#430); then, where
         // there is unified memory, once more in a buffer that spills into host memory.
@@ -4235,7 +4294,36 @@ impl Executor {
                         }
                         Err(e) => return Err(e.into()),
                     },
-                    (None, None) => unreachable!(),
+                    // A prompt graph in a lane (#836).
+                    (None, None) => {
+                        let Some(l) = lane else { unreachable!() };
+                        let a = stage.lanes[l].clone();
+                        match ctx.alloc_graph_shared(&graph, &a) {
+                            // The buffer moved: the lane's other kept graphs point into the old
+                            // one (none of them runs: see `pick_lane`).
+                            Ok(moved) => {
+                                if moved {
+                                    drop_lane(&mut stage.mixed, &a);
+                                }
+                            }
+                            // A failed plan may have freed the lane's buffer: its graphs go, and
+                            // this one is built in a buffer of its own as without lanes.
+                            Err(GgmlError::Alloc { .. }) => {
+                                drop_lane(&mut stage.mixed, &a);
+                                tracing::debug!(
+                                    stage = s,
+                                    lane = l,
+                                    "out of memory in a shared prompt compute buffer: built in \
+                                     a buffer of its own"
+                                );
+                                lane = None;
+                                allocator =
+                                    Some(headroom::step_allocator(buft, padded, roomy, passes));
+                                continue;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
                 }
                 KeptParts::new(&graph, &inputs.list())
             };
@@ -4549,6 +4637,10 @@ impl Executor {
         }
         self.keep_spares();
         self.drop_mixed();
+        // The shared prompt buffers too (#836): the lend wants their memory.
+        for s in &mut self.stages {
+            s.lanes.clear();
+        }
         // A long prompt's steps share one graph shape but the last: one compute buffer per
         // stage, not one per shape kept.
         self.mixed_kept = LENT_MIXED_KEPT;
