@@ -155,7 +155,8 @@ pub(crate) fn row_digests(
 }
 
 /// The step's tokens of graph `g`: the most common `ne[1]` of its row-wise ops (adds, muls,
-/// norms, matmuls), which have shape `[width, tokens]`.
+/// norms), which have shape `[width, tokens]`. Not the matmuls: `--prompt-step-grid-split`
+/// runs a folded step's projections over parts of its tokens.
 ///
 /// # Safety
 /// `g` must be a valid graph.
@@ -166,10 +167,7 @@ unsafe fn step_tokens(g: *mut ffi::ggml_cgraph) -> i64 {
             let n = ffi::ggml_graph_node(g, i);
             if matches!(
                 (*n).op,
-                ffi::ggml_op_GGML_OP_ADD
-                    | ffi::ggml_op_GGML_OP_MUL
-                    | ffi::ggml_op_GGML_OP_RMS_NORM
-                    | ffi::ggml_op_GGML_OP_MUL_MAT
+                ffi::ggml_op_GGML_OP_ADD | ffi::ggml_op_GGML_OP_MUL | ffi::ggml_op_GGML_OP_RMS_NORM
             ) && (*n).ne[2] == 1
                 && (*n).ne[3] == 1
             {
