@@ -178,3 +178,55 @@ fn decode_kernel_tiles_and_shapes() {
     assert_eq!(mv_shape(640, false), Grouped::Mv { rt: 1, kw: 2 });
     assert_eq!(mv_shape(2560, true), Grouped::Mv { rt: 2, kw: 8 });
 }
+
+/// [`sum_rms_quant_op`] refuses rows the CUDA kernel does not quantize whole (#1133): a
+/// 65-wide row would leave its last value out of every block.
+#[test]
+#[should_panic(expected = "rows of a multiple of 64 values")]
+fn sum_quant_rejects_partial_rows() {
+    let ctx = Context::new(8, 0);
+    let srcs = [ctx.new_tensor(types::F32, &[65, 2])];
+    let res = ctx.new_tensor(types::F32, &[65, 2]);
+    let w = ctx.new_tensor(types::F32, &[65]);
+    sum_rms_quant_op(&ctx, &srcs, res, w, 1e-6);
+}
+
+/// [`sum_rms_quant_op`] packs a strided norm weight (#1133): on the CPU the same bytes as the
+/// weight stored contiguously, for widths 64 to 8192.
+#[test]
+fn sum_quant_packs_a_strided_weight() {
+    use crate::ggml::{Backend, ComputeAllocator};
+    for k in [64i64, 512, 8192] {
+        let c = Context::new(8, 0);
+        let t = |ne: &[i64]| c.new_tensor(types::F32, ne);
+        sum_rms_quant_op(&c, &[t(&[k, 2])], t(&[k, 2]), t(&[k]), 1e-6);
+    }
+    let mut cpu = Backend::cpu().unwrap();
+    let (k, n) = (128usize, 3usize);
+    let ctx = Context::new(16, 16);
+    let srcs: Vec<_> = (0..2)
+        .map(|_| ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input())
+        .collect();
+    let res = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
+    let w = ctx.new_tensor(types::F32, &[k as i64]).as_input();
+    // Column 0 of an F32 [2, k]: [k, 1] with a stride of 8 bytes; column 1 is noise.
+    let m = ctx.new_tensor(types::F32, &[2, k as i64]).as_input();
+    let ws = ctx.transpose(ctx.view_2d(m, [1, k as i64], 8, 0));
+    assert!(!ws.is_contiguous());
+    let plain = sum_rms_quant_op(&ctx, &srcs, res, w, 1e-6).as_output();
+    let packed = sum_rms_quant_op(&ctx, &srcs, res, ws, 1e-6).as_output();
+    let mut graph = ctx.new_graph(16);
+    graph.expand(plain);
+    graph.expand(packed);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(cpu.buffer_type()))
+        .unwrap();
+    let value = |i: usize, s: usize| ((i * 7 + s * 13) % 97) as f32 * 0.03 - 1.4;
+    for (j, t) in srcs.iter().chain([&res]).enumerate() {
+        t.set_f32(&(0..k * n).map(|i| value(i, j)).collect::<Vec<_>>());
+    }
+    let wv: Vec<f32> = (0..k).map(|i| 0.5 + i as f32 * 0.01).collect();
+    w.set_f32(&wv);
+    m.set_f32(&wv.iter().flat_map(|&v| [v, -9.0 - v]).collect::<Vec<_>>());
+    cpu.compute(&graph).unwrap();
+    assert_eq!(plain.bytes(), packed.bytes());
+}

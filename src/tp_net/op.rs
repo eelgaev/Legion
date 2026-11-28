@@ -1737,7 +1737,7 @@ pub(super) mod cuda {
                     Some(nm) if nm.a4.is_some() => {
                         let (base, at, width) = nm.a4.expect("an A4 norm");
                         let srcs: Vec<*const c_void> = srcs.iter().map(|&p| p.cast()).collect();
-                        let code = crate::model::nvfp4_a4::sum_rms_quant(
+                        let done = crate::model::nvfp4_a4::sum_rms_quant(
                             &srcs,
                             bf16,
                             res,
@@ -1747,10 +1747,8 @@ pub(super) mod cuda {
                             (nm.row, at, mine.1 / nm.row, width),
                             stream,
                         );
-                        if code != 0 {
-                            return Err(format!(
-                                "tp all-reduce: the sum's W4A4 norm: error {code}"
-                            ));
+                        if let Err(e) = done {
+                            return Err(format!("tp all-reduce: the sum's W4A4 norm: {e}"));
                         }
                     }
                     Some(nm) => {

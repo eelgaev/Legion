@@ -378,6 +378,13 @@ pub fn sum_rms_quant_op<'a>(
             && w.ne() == [k, 1, 1, 1],
         "nvfp4 a4 sum quant: F32 [k, n] partials and residual, an F32 [k] weight"
     );
+    // Whole 64-value rows the CUDA kernel takes, so both backends quantize every value.
+    assert!(
+        k > 0 && k % 64 == 0 && k <= RMS_MAX_K,
+        "nvfp4 a4 sum quant: rows of a multiple of 64 values up to {RMS_MAX_K}, not {k}"
+    );
+    // Both backends read the weight as `k` packed F32s.
+    let w = if w.is_contiguous() { w } else { ctx.cont(w) };
     let (_, total) = normed_layout(k, n);
     let mut args = srcs.to_vec();
     args.extend([res, w]);
@@ -2178,7 +2185,7 @@ mod cuda {
     /// `width` tokens of `k` values at `base` ([`normed_layout`]), to `xs` (the sums of token
     /// `at`; `tp_net.cu`'s bits), and the codes, scales and decode scales of their norm by `w`
     /// (F32 `[k]`) into the node: [`rms_norm_quantize`]'s bits on those sums, without reading
-    /// them back. 0 on success, 1 for a shape it does not take, 2 for a launch error.
+    /// them back. [`SumQuantError`] for a shape it does not take or a failed launch.
     ///
     /// # Safety
     /// Device pointers on the stream's device: `srcs` and `res` of `k * rows` values, `w` of
@@ -2193,17 +2200,17 @@ mod cuda {
         base: *mut u8,
         (k, at, rows, width): (usize, usize, usize, usize),
         stream: *mut c_void,
-    ) -> i32 {
+    ) -> Result<(), SumQuantError> {
         if srcs.is_empty()
             || srcs.len() > 8
             || !k.is_multiple_of(64)
             || k as i64 > RMS_MAX_K
             || rows > u32::MAX as usize
         {
-            return 1;
+            return Err(SumQuantError::Shape);
         }
         if rows == 0 {
-            return 0;
+            return Ok(());
         }
         let ([codes, scales, dec], _) = normed_layout(k as i64, width as i64);
         let (q_ld, s_ld) = q_strides(k as i64);
@@ -2246,18 +2253,44 @@ mod cuda {
                 stream,
             )
         };
-        if code == 0 { 0 } else { 2 }
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(SumQuantError::Launch(code))
+        }
+    }
+
+    /// Why [`sum_rms_quant`] did not enqueue its kernel.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum SumQuantError {
+        /// A shape it does not take.
+        Shape,
+        /// `cudaLaunchKernel`'s status.
+        Launch(i32),
+    }
+
+    impl std::fmt::Display for SumQuantError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Shape => f.write_str("unsupported NVFP4 W4A4 sum norm shape"),
+                Self::Launch(e) => write!(f, "nvfp4 a4 sum rms quant: CUDA error {e}"),
+            }
+        }
     }
 
     pub(super) unsafe fn sum_quant(
         dst: &ffi::ggml_tensor,
         stream: *mut c_void,
     ) -> Result<(), String> {
+        // The graph's op does not check the device (the models' gates do, `supports`).
+        if !super::device_supported() {
+            return Err("unsupported NVFP4 W4A4 sum norm: no FP4 kernels on this GPU".into());
+        }
         let [n_src, eps, ..] = external_params(dst);
         let n_src = n_src as usize;
         // SAFETY: a node made by `sum_rms_quant_op`, tensors in device memory of the stream's
         // device.
-        let code = unsafe {
+        let done = unsafe {
             let res = &*dst.src[n_src];
             let (k, n) = (res.ne[0] as usize, res.ne[1] as usize);
             let srcs: Vec<*const c_void> = (0..n_src)
@@ -2277,11 +2310,7 @@ mod cuda {
                 stream,
             )
         };
-        match code {
-            0 => Ok(()),
-            1 => Err("unsupported NVFP4 W4A4 sum norm".into()),
-            e => Err(format!("nvfp4 a4 sum rms quant: CUDA error {e}")),
-        }
+        done.map_err(|e| e.to_string())
     }
 
     pub(super) unsafe fn swiglu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {

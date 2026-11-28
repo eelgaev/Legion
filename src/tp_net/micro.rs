@@ -474,6 +474,17 @@ pub fn finish_add_norm<'a>(
         !norm.a4 || (at == 0 && width == cols && into.is_none()),
         "tp micro exchange: the W4A4 norm of a whole output"
     );
+    // Both backends read the weight as `row` packed F32s, in rows the CUDA kernel takes.
+    let a4_max = crate::model::nvfp4_a4::RMS_MAX_K;
+    assert!(
+        !norm.a4
+            || (norm.w.ty() == types::F32
+                && norm.w.is_contiguous()
+                && row % 64 == 0
+                && row <= a4_max),
+        "tp micro exchange: the W4A4 norm's weight as contiguous F32, rows of a multiple of \
+         64 values up to {a4_max}"
+    );
     let total = super::op::norm_bytes(row as usize, width as usize, &norm);
     let mut args = vec![s.x, s.node, res, norm.w];
     if let Some(t) = into {

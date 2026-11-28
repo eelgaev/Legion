@@ -555,26 +555,75 @@ fn a4_normed_finish_matches_the_separate_ops() {
     let (q_ld, s_ld) = (q_ld as usize, s_ld as usize);
     for (round, r0) in results[0].iter().enumerate() {
         let [f, y, q] = r0;
-        assert_eq!(&f[..4 * row * n], &y[..], "sums, round {round}");
+        let [f1, y1, q1] = &results[1][round];
+        // Rank 1's as rank 0's: the references whole, the finish's node where it writes (its
+        // padding between the parts is not written).
+        assert_eq!((y1, q1), (y, q), "rank 1 references, round {round}");
+        let sums = ..4 * row * n;
+        assert_eq!(&f[sums], &y[..], "sums, round {round}");
+        assert_eq!(&f1[sums], &f[sums], "rank 1 sums, round {round}");
         for t in 0..n {
             let part = |b: &[u8], at: usize, len: usize| b[at..at + len].to_vec();
             let at = |base: usize, ld: usize| base + t * ld;
-            assert_eq!(
-                part(f, at(codes, q_ld), q_ld),
-                part(q, at(q_codes, q_ld), q_ld),
-                "codes, token {t}, round {round}"
-            );
-            assert_eq!(
-                part(f, at(scales, s_ld), s_ld),
-                part(q, at(q_scales, s_ld), s_ld),
-                "scales, token {t}, round {round}"
-            );
-            assert_eq!(
-                part(f, at(dec, 4), 4),
-                part(q, at(q_dec, 4), 4),
-                "decode scale, token {t}, round {round}"
-            );
+            for (what, fa, qa, len) in [
+                ("codes", at(codes, q_ld), at(q_codes, q_ld), q_ld),
+                ("scales", at(scales, s_ld), at(q_scales, s_ld), s_ld),
+                ("decode scale", at(dec, 4), at(q_dec, 4), 4),
+            ] {
+                assert_eq!(
+                    part(f, fa, len),
+                    part(q, qa, len),
+                    "{what}, token {t}, round {round}"
+                );
+                assert_eq!(
+                    part(f1, fa, len),
+                    part(f, fa, len),
+                    "rank 1 {what}, token {t}, round {round}"
+                );
+            }
         }
-        assert_eq!(&results[1][round], r0, "rank 1, round {round}");
     }
+}
+
+/// [`finish_add_norm`] with [`Norm::a4`] only takes a contiguous F32 weight and rows the CUDA
+/// kernel quantizes whole (#1133): a strided weight, a BF16 one and a 65-wide row are refused
+/// when the graph is built.
+#[test]
+fn a4_normed_finish_rejects_weights_and_rows_it_cannot_read() {
+    use crate::tp_net::Norm;
+    #[derive(Clone, Copy)]
+    enum Weight {
+        F32,
+        Bf16,
+        /// Column 0 of an F32 `[2, row]`: `[row, 1]` with a stride of 8 bytes.
+        Strided,
+    }
+    let build = |row: i64, kind: Weight| {
+        std::panic::catch_unwind(|| {
+            let ctx = Context::new(16, 16);
+            let x = ctx.new_tensor(types::F32, &[row, 3]);
+            let res = ctx.new_tensor(types::F32, &[row, 3]);
+            let w = match kind {
+                Weight::F32 => ctx.new_tensor(types::F32, &[row]),
+                Weight::Bf16 => ctx.new_tensor(types::BF16, &[row]),
+                Weight::Strided => {
+                    let m = ctx.new_tensor(types::F32, &[2, row]);
+                    ctx.transpose(ctx.view_2d(m, [1, row], 8, 0))
+                }
+            };
+            let s = all_reduce_start(&ctx, 0, x, 3);
+            let norm = Norm {
+                w,
+                eps: 1e-6,
+                bf16: false,
+                a4: true,
+            };
+            finish_add_norm(&ctx, s, res, 3, 0, None, norm);
+        })
+        .is_ok()
+    };
+    assert!(build(128, Weight::F32), "a contiguous F32 weight");
+    assert!(!build(65, Weight::F32), "a 65-wide row");
+    assert!(!build(128, Weight::Bf16), "a BF16 weight");
+    assert!(!build(128, Weight::Strided), "a strided weight");
 }
