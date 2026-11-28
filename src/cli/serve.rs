@@ -1343,6 +1343,15 @@ struct EngineArgs {
     /// steps).
     #[arg(long)]
     prefill_even: bool,
+    /// Model engine: a prompt chunk bigger than this many tokens holds whole multiples of it,
+    /// and the part of a prompt past them runs as a step of its own, so a prompt is cut where
+    /// steps of this size cut it, only fewer times: an 8,240-token prompt in steps of 12,288
+    /// runs as 8,192 + 48 (4,096 + 4,096 + 48 in steps of 4,096). The bigger steps then give
+    /// the same greedy output as steps of this size for a prompt alone in its steps (decode
+    /// rows sharing a step move the cuts). 0 (the default): off, a bigger step takes the whole
+    /// prompt it holds, which can move the output. --prefill-even keeps its own step sizes.
+    #[arg(long, value_name = "TOKENS", default_value_t = 0)]
+    prompt_step_grid: usize,
     /// Model engine: before taking requests, run one prompt of about this many tokens (greedy,
     /// one output token). A step larger than any before it grows its buffers: the step's compute
     /// buffer, ggml-cuda's pool and, under --tp-rank, the pinned exchange buffers (registered
@@ -2260,6 +2269,7 @@ pub async fn run(
                 first_gpu: 0,
                 prefill_chunk,
                 prefill_even: e.prefill_even,
+                prompt_grid: e.prompt_step_grid,
                 ring_step: e.prefill_chunk,
                 swa_full: e.swa_full,
                 swa_ring: e.swa_ring,
