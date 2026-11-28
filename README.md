@@ -216,6 +216,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) | none | 13.0 | 50.8 | 157.4 | 927 | 890 | 776 ²⁰ |
+| Legion | UD-Q4_K_XL GGUF | DFlash ²¹ | 17-24 | 51.9 | 138.4 | 927 | 896 | 780 |
 
 ¹ No drafting: llama.cpp b12062 aborts with the MTP drafter on this model. 123K did not finish in 20 minutes.
 
@@ -265,6 +266,9 @@ for either engine: the prompt takes both Sparks above 80 C within a minute.
 
 ²⁰ The 123K prompt is 126,094 Muse tokens (8K: 8,466, 32K: 33,672). One round of the deterministic client; no
 llama.cpp row yet.
+
+²¹ The repo's own DFlash drafter, `dflash-kquant.gguf` (see the run command). Greedy text can differ from the row
+without drafting at near ties (the verify steps run the batched matmuls). 16 users are faster without it.
 
 Measured 2026-10-20 to 2026-11-28. Each new speed record is added here.
 
