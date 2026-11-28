@@ -574,24 +574,558 @@ fn cuda_q40_mm_time_at_4096_rows() {
             *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
             use_variant(0);
         }
+        // One line a shape: each matmul's ms and share of the peak (TOPS without a peak).
         let tops = |ms: f64| 2.0 * (k * rows * n) as f64 / ms / 1e9;
-        for (i, &t) in ms.iter().enumerate() {
-            let name = if i == 0 {
-                "ggml".to_string()
-            } else {
-                cuda::kernel_name(i - 1)
-            };
-            let share = if peak > 0.0 {
-                format!(", {:.0}% of peak", 100.0 * tops(t) / peak)
-            } else {
-                String::new()
-            };
-            println!(
-                "{k}x{rows}, {n} columns, {name}: {t:.2} ms ({:.0} TOPS{share}), {:.2}x ggml, {:.2}x the first version",
-                tops(t),
-                ms[0] / t,
-                ms[v1] / t
-            );
+        let parts: Vec<String> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let name = if i == 0 {
+                    "ggml".to_string()
+                } else {
+                    cuda::kernel_name(i - 1)
+                };
+                let share = if peak > 0.0 {
+                    format!("{:.0}%", 100.0 * tops(t) / peak)
+                } else {
+                    format!("{:.0} TOPS", tops(t))
+                };
+                format!("{name} {t:.2} ({share})")
+            })
+            .collect();
+        println!(
+            "{k}x{rows} at {n}, ms: {}; q40_mm {:.2}x ggml, {:.2}x the first version",
+            parts.join(", "),
+            ms[0] / ms[1],
+            ms[v1] / ms[1]
+        );
+    }
+}
+
+/// `x` (`k` x `n` F32 columns) quantized on the host in the op's layout ([`quant_bytes`]).
+fn quant_buf(x: &[f32], k: usize, n: usize) -> Vec<u8> {
+    let n_pad = n_padded(n as i64) as usize;
+    let mut buf = vec![0u8; quant_bytes(k as i64, n as i64)];
+    for c in 0..n {
+        let (q, d) = quantize_col(&x[c * k..(c + 1) * k]);
+        // SAFETY: `buf` holds the blocks and scales of `k` x `n_pad`.
+        unsafe { put_col(buf.as_mut_ptr(), k, n_pad, c, &q, &d) };
+    }
+    buf
+}
+
+/// The layout's places: every column's blocks and scales come back as written, and no two
+/// columns' bytes meet.
+#[test]
+fn quant_columns_round_trip() {
+    let (k, n) = (512usize, 130usize);
+    let x = input(k, n, 21);
+    let buf = quant_buf(&x, k, n);
+    let n_pad = n_padded(n as i64) as usize;
+    for c in 0..n {
+        let (q, d) = quantize_col(&x[c * k..(c + 1) * k]);
+        let (gq, gd) = get_col(&buf, k, n_pad, c);
+        assert_eq!(q, gq, "column {c}");
+        assert_eq!(
+            d.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            gd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "column {c}"
+        );
+    }
+    let mut seen = vec![false; buf.len()];
+    for c in 0..n_pad {
+        for kb in 0..k / 32 {
+            for w in 0..8 {
+                let (at, sd) = quant_at(c, kb, w, n_pad);
+                for b in at..at + 4 {
+                    assert!(!seen[b], "byte {b}");
+                    seen[b] = true;
+                }
+                if w == 0 {
+                    let s = k / 32 * n_pad * 32 + sd * 4;
+                    assert!(!seen[s], "scale {s}");
+                    seen[s..s + 4].fill(true);
+                }
+            }
         }
     }
+    assert!(seen.iter().all(|&s| s));
+}
+
+/// On the CPU, the op over its input quantized by its own node ([`quantize`], [`mul_mat_q`])
+/// is the op's product, bit for bit.
+#[test]
+fn cpu_q40_mm_reads_its_quantized_input() {
+    let (k, rows, n) = (512i64, 128i64, 520i64);
+    let ctx = Context::new(16, 16);
+    let w = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    let a = mul_mat(&ctx, w, x).as_output();
+    let b = mul_mat_q(&ctx, w, quantize(&ctx, x), n).as_output();
+    let mut graph = ctx.new_graph(16);
+    graph.expand(a);
+    graph.expand(b);
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    w.set_bytes(&q4_0_matrix(k as usize, rows as usize, 5));
+    x.set_f32(&input(k as usize, n as usize, 6));
+    backend.compute(&graph).unwrap();
+    assert_eq!(b.ne(), [rows, n, 1, 1]);
+    assert!(a.bytes() == b.bytes(), "the products differ");
+}
+
+/// On the CPU, [`quantize_norm`] and [`quantize_geglu`] keep (with `y`) values close to ggml's
+/// norm and GeGLU, and their blocks are those values' quantization.
+#[test]
+fn cpu_fused_quantizations_quantize_their_values() {
+    let (k, n) = (512usize, 130usize);
+    let eps = 1e-6f32;
+    let ctx = Context::new(32, 32);
+    let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
+    let nw = ctx.new_tensor(types::F32, &[k as i64]).as_input();
+    let up = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
+    let normed = ctx.mul(ctx.rms_norm(x, eps), nw).as_output();
+    let nq = quantize_norm(&ctx, x, nw, eps, true).as_output();
+    let act = ctx.geglu_split(x, up).as_output();
+    let gq = quantize_geglu(&ctx, x, up, true).as_output();
+    let mut graph = ctx.new_graph(32);
+    for t in [normed, nq, act, gq] {
+        graph.expand(t);
+    }
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    x.set_f32(&input(k, n, 31));
+    let wv: Vec<f32> = noise(k, 32).iter().map(|v| 1.0 + 0.5 * v).collect();
+    nw.set_f32(&wv);
+    up.set_f32(&noise(k * n, 33));
+    backend.compute(&graph).unwrap();
+    let n_pad = n_padded(n as i64) as usize;
+    let qb = quant_bytes(k as i64, n as i64);
+    for (want, node) in [(normed, nq), (act, gq)] {
+        let want = want.to_f32();
+        let bytes = node.bytes();
+        let got: Vec<f32> = bytes[qb..]
+            .chunks(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(got.len(), k * n);
+        for c in 0..n {
+            let col = &got[c * k..(c + 1) * k];
+            let wc = &want[c * k..(c + 1) * k];
+            let mag = wc.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for (a, b) in col.iter().zip(wc) {
+                assert!(
+                    (a - b).abs() <= 2e-3 * mag + 1e-12,
+                    "column {c}: {a} vs {b}"
+                );
+            }
+            let (q, d) = quantize_col(col);
+            let (gq, gd) = get_col(&bytes, k, n_pad, c);
+            assert_eq!(q, gq, "column {c}");
+            assert!(d.iter().zip(&gd).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+    }
+}
+
+/// Whether columns `0..n` of two quantizations of `k` values agree, bit for bit: how many
+/// columns differ.
+fn quant_cols_differ(a: &[u8], b: &[u8], k: usize, n: usize) -> usize {
+    let n_pad = n_padded(n as i64) as usize;
+    (0..n)
+        .filter(|&c| {
+            let (qa, da) = get_col(a, k, n_pad, c);
+            let (qb, db) = get_col(b, k, n_pad, c);
+            qa != qb || da.iter().zip(&db).any(|(x, y)| x.to_bits() != y.to_bits())
+        })
+        .count()
+}
+
+/// On a GB10 the fused quantizations write the bytes of the op's quantization of ggml-cuda's
+/// F32 norm (`mul(rms_norm(x), w)`) and GeGLU (`geglu_split`), and the values they quantize
+/// (with `y`) are ggml's bit for bit; the op over a quantized input ([`mul_mat_q`]) is
+/// ggml's product bit for bit (FFN shapes), all at 512 to 4097 columns.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_q40_mm_fused_quant_is_byte_exact() {
+    let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut gpu, sms)) = gb10() else { return };
+    let eps = 1e-6f32;
+    let mut cases = 0;
+    let mut bad = Vec::new();
+    for n in CHECKED_N {
+        // The norm over Gemma 4 31B's residual, the GeGLU over its FFN's hidden values.
+        for (kind, k) in [("norm", 5376i64), ("geglu", 21504i64)] {
+            let ctx = Context::new(32, 32);
+            let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+            let x2 = if kind == "norm" {
+                ctx.new_tensor(types::F32, &[k]).as_input()
+            } else {
+                ctx.new_tensor(types::F32, &[k, n]).as_input()
+            };
+            let (want, fused) = if kind == "norm" {
+                (
+                    ctx.mul(ctx.rms_norm(x, eps), x2),
+                    quantize_norm(&ctx, x, x2, eps, true),
+                )
+            } else {
+                (ctx.geglu_split(x, x2), quantize_geglu(&ctx, x, x2, true))
+            };
+            let want = want.as_output();
+            let plain = quantize(&ctx, want).as_output();
+            let fused = fused.as_output();
+            let mut graph = ctx.new_graph(32);
+            for t in [want, plain, fused] {
+                graph.expand(t);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            x.set_f32(&input(k as usize, n as usize, 40 + n as u64));
+            if kind == "norm" {
+                let wv: Vec<f32> = noise(k as usize, 41)
+                    .iter()
+                    .map(|v| 1.0 + 0.5 * v)
+                    .collect();
+                x2.set_f32(&wv);
+            } else {
+                x2.set_f32(&input(k as usize, n as usize, 42 + n as u64));
+            }
+            gpu.compute(&graph).unwrap();
+            let qb = quant_bytes(k, n);
+            let fb = fused.bytes();
+            let values = want
+                .bytes()
+                .chunks(4)
+                .zip(fb[qb..].chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            let cols = quant_cols_differ(&plain.bytes(), &fb, k as usize, n as usize);
+            if values > 0 || cols > 0 {
+                println!(
+                    "{kind} {k} x {n}: {values} F32 values differ, {cols} quantized columns differ"
+                );
+                bad.push(format!("{kind} {k} x {n}"));
+            }
+            cases += 1;
+        }
+        // The op on a quantized input against ggml's mul_mat.
+        for (k, rows) in [(5376i64, 21504i64), (21504, 5376), (5376, 8192)] {
+            if !ggml_tiles(rows, k, n, sms) {
+                continue;
+            }
+            let ggml = case(&mut gpu, false, k, rows, n);
+            let ctx = Context::new(16, 16);
+            let w = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+            let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+            let y = mul_mat_q(&ctx, w, quantize(&ctx, x), n).as_output();
+            let mut graph = ctx.new_graph(16);
+            graph.expand(y);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            w.set_bytes(&q4_0_matrix(k as usize, rows as usize, (k + rows) as u64));
+            x.set_f32(&input(k as usize, n as usize, n as u64));
+            gpu.compute(&graph).unwrap();
+            let diff = y
+                .bytes()
+                .chunks(4)
+                .zip(ggml.chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            if diff > 0 {
+                println!(
+                    "{k}x{rows}, {n} columns, quantized input: {diff} values differ from ggml"
+                );
+                bad.push(format!("{k}x{rows} at {n}"));
+            }
+            cases += 1;
+        }
+    }
+    println!(
+        "fused quantizations and quantized inputs: {cases} cases, {} differ",
+        bad.len()
+    );
+    assert!(bad.is_empty(), "differ: {}", bad.join(", "));
+}
+
+/// The time per call at 4096 columns of the op over an input quantized in advance (no
+/// quantization in the timed graph) at the timing test's shapes, and of the producers it
+/// replaces: ggml's norm and GeGLU (F32 out) with the op's quantization of their output, and
+/// the fused quantizations. 8 calls a graph on two inputs in turn, the second of two runs.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_q40_mm_fused_time_at_4096_rows() {
+    const CALLS: usize = 8;
+    let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut gpu, _)) = gb10() else { return };
+    let n = 4096i64;
+    // The second run's time per call.
+    fn time(gpu: &mut Backend, graph: &crate::ggml::Graph<'_>) -> f64 {
+        gpu.compute(graph).unwrap();
+        let t0 = std::time::Instant::now();
+        gpu.compute(graph).unwrap();
+        t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64
+    }
+    for (k, rows) in CHECKED {
+        let ctx = Context::new(64, 64);
+        let w = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+        let bytes = quant_bytes(k, n) as i64;
+        let xs = [0, 1].map(|_| ctx.new_tensor(types::I8, &[bytes]).as_input().as_output());
+        let mut graph = ctx.new_graph(64);
+        let mut last = None;
+        for c in 0..CALLS {
+            let y = mul_mat_q(&ctx, w, xs[c % 2], n);
+            graph.expand(y);
+            last = Some(y);
+        }
+        last.unwrap().as_output();
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        w.set_bytes(&q4_0_matrix(k as usize, rows as usize, 11));
+        for (s, x) in xs.iter().enumerate() {
+            let v = input(k as usize, n as usize, 12 + s as u64);
+            x.set_bytes(&quant_buf(&v, k as usize, n as usize));
+        }
+        let ms = time(&mut gpu, &graph);
+        let tops = 2.0 * (k * rows * n) as f64 / ms / 1e9;
+        println!("{k}x{rows}, {n} columns, quantized input: {ms:.2} ms ({tops:.0} TOPS)");
+    }
+    // The producers: 0 ggml's F32 op, 1 it plus the op's quantization, 2 the fused one.
+    let eps = 1e-6f32;
+    for (kind, k) in [("norm", 5376i64), ("geglu", 21504i64)] {
+        let mut ms = [0f64; 3];
+        for (i, ms) in ms.iter_mut().enumerate() {
+            let ctx = Context::new(64, 128);
+            let xs = [0, 1].map(|_| ctx.new_tensor(types::F32, &[k, n]).as_input().as_output());
+            let x2s = [0, 1].map(|_| {
+                if kind == "norm" {
+                    ctx.new_tensor(types::F32, &[k])
+                } else {
+                    ctx.new_tensor(types::F32, &[k, n])
+                }
+                .as_input()
+                .as_output()
+            });
+            let mut graph = ctx.new_graph(128);
+            let mut last = None;
+            for c in 0..CALLS {
+                let (x, x2) = (xs[c % 2], x2s[c % 2]);
+                let y = match (i, kind) {
+                    (2, "norm") => quantize_norm(&ctx, x, x2, eps, false),
+                    (2, _) => quantize_geglu(&ctx, x, x2, false),
+                    (_, "norm") => ctx.mul(ctx.rms_norm(x, eps), x2),
+                    _ => ctx.geglu_split(x, x2),
+                };
+                let y = if i == 1 { quantize(&ctx, y) } else { y };
+                graph.expand(y);
+                last = Some(y);
+            }
+            last.unwrap().as_output();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            for (s, (x, x2)) in xs.iter().zip(&x2s).enumerate() {
+                x.set_f32(&input(k as usize, n as usize, 50 + s as u64));
+                if kind == "norm" {
+                    x2.set_f32(&vec![1.0; k as usize]);
+                } else {
+                    x2.set_f32(&input(k as usize, n as usize, 52 + s as u64));
+                }
+            }
+            *ms = time(&mut gpu, &graph);
+        }
+        println!(
+            "{kind} {k} x {n}: ggml {:.2} ms, + quantization {:.2} ms, fused {:.2} ms (saves {:.2} ms)",
+            ms[0],
+            ms[1],
+            ms[2],
+            ms[1] - ms[2]
+        );
+    }
+}
+
+/// On the CPU the GeGLU pair ([`mul_mat_geglu_q`]) writes the bytes of the gate and up matmuls
+/// over the quantized input then [`quantize_geglu`] of their outputs.
+#[test]
+fn cpu_q40_geglu_pair_is_the_matmuls_and_quantize_geglu() {
+    let (k, rows, n) = (512i64, 256i64, 520i64);
+    let ctx = Context::new(32, 32);
+    let gate = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+    let up = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    let xq = quantize(&ctx, x);
+    let g = mul_mat_q(&ctx, gate, xq, n);
+    let u = mul_mat_q(&ctx, up, xq, n);
+    let want = quantize_geglu(&ctx, g, u, false).as_output();
+    let got = mul_mat_geglu_q(&ctx, gate, up, xq, n).as_output();
+    let mut graph = ctx.new_graph(32);
+    graph.expand(want);
+    graph.expand(got);
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    gate.set_bytes(&q4_0_matrix(k as usize, rows as usize, 61));
+    up.set_bytes(&q4_0_matrix(k as usize, rows as usize, 62));
+    x.set_f32(&input(k as usize, n as usize, 63));
+    backend.compute(&graph).unwrap();
+    assert_eq!(got.ne()[0] as usize, quant_bytes(rows, n));
+    let (a, b) = (want.bytes(), got.bytes());
+    assert_eq!(quant_cols_differ(&a, &b, rows as usize, n as usize), 0);
+    // The quantized GeGLU is not trivial: the all-zero input column quantizes to zeros, the
+    // others not.
+    let (q0, _) = get_col(&b, rows as usize, n_padded(n) as usize, 0);
+    let (q1, _) = get_col(&b, rows as usize, n_padded(n) as usize, 1);
+    assert!(q0.iter().any(|&v| v != 0) && q1.iter().all(|&v| v == 0));
+}
+
+/// The pair accepts matching gate and up weights only.
+#[test]
+fn geglu_pair_fits_matching_weights() {
+    let ctx = Context::new(8, 0);
+    let gate = ctx.new_tensor(types::Q4_0, &[5376, 21504]);
+    let up = ctx.new_tensor(types::Q4_0, &[5376, 21504]);
+    let other = ctx.new_tensor(types::Q4_0, &[5376, 8192]);
+    let q8 = ctx.new_tensor(types::Q8_0, &[5376, 21504]);
+    assert!(geglu_pair_fits(gate, up));
+    assert!(!geglu_pair_fits(gate, other));
+    assert!(!geglu_pair_fits(gate, q8));
+}
+
+/// On a GB10 the GeGLU pair ([`mul_mat_geglu_q`]) writes round 4's bytes, the op's gate and up
+/// matmuls over the quantized input and then [`quantize_geglu`] of their F32 outputs, at the
+/// timing test's shapes as gate / up pairs and 512 to 4097 columns.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_q40_mm_geglu_pair_is_byte_exact() {
+    let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut gpu, _)) = gb10() else { return };
+    let mut cases = 0;
+    let mut bad = Vec::new();
+    for (k, rows) in CHECKED {
+        let wg = q4_0_matrix(k as usize, rows as usize, (k + rows) as u64);
+        let wu = q4_0_matrix(k as usize, rows as usize, (k + rows + 1) as u64);
+        for n in CHECKED_N {
+            let ctx = Context::new(32, 32);
+            let gate = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+            let up = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
+            let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+            let xq = quantize(&ctx, x);
+            let g = mul_mat_q(&ctx, gate, xq, n);
+            let u = mul_mat_q(&ctx, up, xq, n);
+            let want = quantize_geglu(&ctx, g, u, false).as_output();
+            let got = mul_mat_geglu_q(&ctx, gate, up, xq, n).as_output();
+            let mut graph = ctx.new_graph(32);
+            graph.expand(want);
+            graph.expand(got);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            gate.set_bytes(&wg);
+            up.set_bytes(&wu);
+            x.set_f32(&input(k as usize, n as usize, 70 + n as u64));
+            gpu.compute(&graph).unwrap();
+            let cols = quant_cols_differ(&want.bytes(), &got.bytes(), rows as usize, n as usize);
+            if cols > 0 {
+                println!("GeGLU pair {k}x{rows}, {n} columns: {cols} quantized columns differ");
+                bad.push(format!("{k}x{rows} at {n}"));
+            }
+            cases += 1;
+        }
+    }
+    println!(
+        "GeGLU pair vs matmuls + quantize_geglu: {cases} cases, {} differ",
+        bad.len()
+    );
+    assert!(bad.is_empty(), "differ: {}", bad.join(", "));
+}
+
+/// The time at 4096 columns of Gemma 4 31B's FFN over an input quantized in advance: round 4's
+/// gate and up matmuls and fused GeGLU quantization against the GeGLU pair, then each with the
+/// down matmul (the whole FFN). 4 FFNs a graph on two inputs in turn, the second of two runs.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_q40_mm_ffn_time_at_4096_rows() {
+    const CALLS: usize = 4;
+    let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut gpu, _)) = gb10() else { return };
+    let (n, k, hid) = (4096i64, 5376i64, 21504i64);
+    let wg = q4_0_matrix(k as usize, hid as usize, 81);
+    let wu = q4_0_matrix(k as usize, hid as usize, 82);
+    let wd = q4_0_matrix(hid as usize, k as usize, 83);
+    let bufs: Vec<Vec<u8>> = (0..2)
+        .map(|s| {
+            quant_buf(
+                &input(k as usize, n as usize, 84 + s),
+                k as usize,
+                n as usize,
+            )
+        })
+        .collect();
+    // 0 round 4 gate / up + GeGLU, 1 the pair, 2 and 3 the same with down.
+    let mut ms = [0f64; 4];
+    for (i, ms) in ms.iter_mut().enumerate() {
+        let ctx = Context::new(64, 64);
+        let gate = ctx.new_tensor(types::Q4_0, &[k, hid]).as_input();
+        let up = ctx.new_tensor(types::Q4_0, &[k, hid]).as_input();
+        let down = ctx.new_tensor(types::Q4_0, &[hid, k]).as_input();
+        let bytes = quant_bytes(k, n) as i64;
+        let xs = [0, 1].map(|_| ctx.new_tensor(types::I8, &[bytes]).as_input().as_output());
+        let mut graph = ctx.new_graph(64);
+        let mut last = None;
+        for c in 0..CALLS {
+            let xq = xs[c % 2];
+            let act = if i % 2 == 0 {
+                let g = mul_mat_q(&ctx, gate, xq, n);
+                let u = mul_mat_q(&ctx, up, xq, n);
+                quantize_geglu(&ctx, g, u, false)
+            } else {
+                mul_mat_geglu_q(&ctx, gate, up, xq, n)
+            };
+            let y = if i >= 2 {
+                mul_mat_q(&ctx, down, act, n)
+            } else {
+                act
+            };
+            graph.expand(y);
+            last = Some(y);
+        }
+        last.unwrap().as_output();
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        gate.set_bytes(&wg);
+        up.set_bytes(&wu);
+        if i >= 2 {
+            // Not in the graphs without down: no memory.
+            down.set_bytes(&wd);
+        }
+        for (x, b) in xs.iter().zip(&bufs) {
+            x.set_bytes(b);
+        }
+        gpu.compute(&graph).unwrap();
+        let t0 = std::time::Instant::now();
+        gpu.compute(&graph).unwrap();
+        *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
+    }
+    let tops = |mm: i64, t: f64| 2.0 * (mm * k * hid * n) as f64 / t / 1e9;
+    println!(
+        "FFN gate/up + GeGLU at {n}: round 4 {:.2} ms ({:.0} TOPS), pair {:.2} ms ({:.0} TOPS), {:.3}x",
+        ms[0],
+        tops(2, ms[0]),
+        ms[1],
+        tops(2, ms[1]),
+        ms[0] / ms[1]
+    );
+    println!(
+        "FFN gate/up + GeGLU + down at {n}: round 4 {:.2} ms ({:.0} TOPS), pair {:.2} ms ({:.0} TOPS), {:.3}x",
+        ms[2],
+        tops(3, ms[2]),
+        ms[3],
+        tops(3, ms[3]),
+        ms[2] / ms[3]
+    );
 }

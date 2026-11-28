@@ -25,7 +25,9 @@
 //! with rows a multiple of 128 and K of 256, at [`MIN_TOKENS`] or more columns ([`fits`]); on by default,
 //! `legion serve --q40-mm-ggml` keeps ggml's MMQ (the same output). Decode and verify steps
 //! (fewer columns) stay on ggml's MMVQ / MMQ. Consecutive op nodes on the same input quantize it
-//! once ([`quant_run`]). The CPU implementation is a reference for the tests: the same sums
+//! once ([`quant_run`]). A GeGLU FFN's gate and up matmuls run as one kernel whose epilogue
+//! writes the GeGLU's quantization for the down matmul ([`mul_mat_geglu_q`]), the bytes of the
+//! two matmuls' F32 outputs through [`quantize_geglu`]. The CPU implementation is a reference for the tests: the same sums
 //! (scalar `mul_add`), not necessarily the GPU's bits (the GPU's division and reciprocal of the
 //! quantization are fast-math ones).
 
@@ -44,6 +46,35 @@ static Q40_MM: ExternalOp = ExternalOp {
     #[cfg(not(feature = "cuda"))]
     cuda: None,
 };
+
+/// The quantization of a matmul's input as its own node ([`quantize`], [`quantize_norm`],
+/// [`quantize_geglu`]): the matmul's layout of the blocks, the bytes the op's own quantization
+/// writes, read by [`mul_mat_q`] nodes.
+static Q40_QUANT: ExternalOp = ExternalOp {
+    name: "q40_quant",
+    cpu: cpu_q40_quant,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda::q40_quant),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+/// The GeGLU pair ([`mul_mat_geglu_q`]): a gate and an up matmul over one quantized input, and
+/// their GeGLU quantized as the down matmul's input, as one node.
+static Q40_GEGLU: ExternalOp = ExternalOp {
+    name: "q40_geglu",
+    cpu: cpu_q40_geglu,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda::q40_geglu),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+/// What a [`Q40_QUANT`] node quantizes (its first parameter): its F32 input; ggml's
+/// `mul(rms_norm(x, eps), w)` of its inputs `x`, `w`; ggml's `geglu_split(gate, up)`.
+const QUANT_PLAIN: i32 = 0;
+const QUANT_NORM: i32 = 1;
+const QUANT_GEGLU: i32 = 2;
 
 /// Fewest columns the op takes: prompt steps (verify and decode steps keep ggml's kernels).
 pub const MIN_TOKENS: i64 = 512;
@@ -118,6 +149,11 @@ pub fn ggml_tiles(rows: i64, k: i64, n: i64, sms: i64) -> bool {
 /// weight in its memory 16-byte aligned, shapes the op takes ([`fits`]) and ggml's plan a CTA
 /// per tile ([`ggml_tiles`]).
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
+    takes_shape(w, (x.ty(), x.ne(), x.nb()))
+}
+
+/// [`takes`] for an `x` of type, shape and strides `x` (one not built yet).
+pub fn takes_shape(w: Tensor<'_>, x: (ffi::ggml_type, [i64; 4], [usize; 4])) -> bool {
     if !(ON.load(Ordering::Relaxed) && cfg!(feature = "cuda")) {
         return false;
     }
@@ -130,8 +166,55 @@ pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
         && !w.is_host()
         && !w.is_meta()
         && aligned
-        && fits((w.ty(), w.ne(), w.nb()), (x.ty(), x.ne(), x.nb()))
-        && ggml_tiles(w.ne()[1], w.ne()[0], x.ne()[1], sms)
+        && fits((w.ty(), w.ne(), w.nb()), x)
+        && ggml_tiles(w.ne()[1], w.ne()[0], x.1[1], sms)
+}
+
+/// The type, shape and strides of a contiguous F32 tensor of `ne` (`[k, n]`).
+pub fn f32_shape(ne: [i64; 2]) -> (ffi::ggml_type, [i64; 4], [usize; 4]) {
+    let row = ne[0] as usize * 4;
+    let nb2 = row * ne[1] as usize;
+    (types::F32, [ne[0], ne[1], 1, 1], [4, row, nb2, nb2])
+}
+
+/// Whether [`quantize_norm`] takes `mul(rms_norm(x, eps), w)`: an F32 `x` of contiguous
+/// columns 16-byte apart (`[k, n]`, `k` a multiple of 256) and a contiguous F32 `w` of `k`,
+/// both in GPU memory.
+pub fn norm_fits(x: Tensor<'_>, w: Tensor<'_>) -> bool {
+    let [k, n, x2, x3] = x.ne();
+    let nb = x.nb();
+    x.ty() == types::F32
+        && w.ty() == types::F32
+        && k > 0
+        && k % K_STEP == 0
+        && n > 0
+        && x2 == 1
+        && x3 == 1
+        && nb[0] == 4
+        && nb[1] % 16 == 0
+        && w.ne() == [k, 1, 1, 1]
+        && w.nb()[0] == 4
+        && !x.is_host()
+        && !w.is_host()
+        && !x.is_meta()
+        && !w.is_meta()
+}
+
+/// Whether [`quantize_geglu`] takes `geglu_split(gate, up)`: F32 `[k, n]` of the same shape,
+/// contiguous columns 16 bytes apart, `k` a multiple of 256.
+pub fn geglu_fits(gate: Tensor<'_>, up: Tensor<'_>) -> bool {
+    let [k, n, g2, g3] = gate.ne();
+    let ok = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4 && t.nb()[1] % 16 == 0;
+    ok(gate)
+        && ok(up)
+        && !gate.is_meta()
+        && !up.is_meta()
+        && up.ne() == gate.ne()
+        && k > 0
+        && k % K_STEP == 0
+        && n > 0
+        && g2 == 1
+        && g3 == 1
 }
 
 /// [`takes`] on shapes: a Q4_0 weight `[k, rows]` with contiguous rows 16-byte aligned (`k` a
@@ -210,6 +293,256 @@ pub fn mul_mat<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Tensor<'a>
     ctx.external(&Q40_MM, types::F32, [w.ne()[1], x.ne()[1], 1, 1], &[x, w])
 }
 
+/// [`mul_mat`] of `w` over `n` columns already quantized in `xq` (a [`quantize`],
+/// [`quantize_norm`] or [`quantize_geglu`] node of `w`'s `k`, or [`quant_bytes`] I8 bytes in
+/// that layout): the same output, without the op's own quantization. Where [`takes`] takes
+/// `w` for the F32 `[k, n]` columns.
+pub fn mul_mat_q<'a>(ctx: &'a Context, w: Tensor<'a>, xq: Tensor<'a>, n: i64) -> Tensor<'a> {
+    let k = w.ne()[0];
+    assert!(
+        fits((w.ty(), w.ne(), w.nb()), f32_shape([k, n]))
+            && xq.ty() == types::I8
+            && xq.ne()[0] as usize >= quant_bytes(k, n),
+        "q40_mm: shapes"
+    );
+    ctx.external(&Q40_MM, types::F32, [w.ne()[1], n, 1, 1], &[xq, w])
+}
+
+/// Whether [`mul_mat_geglu_q`] takes the weights `gate` and `up` (each one [`takes`] takes):
+/// the same type, shape and strides, on the same GPU.
+pub fn geglu_pair_fits(gate: Tensor<'_>, up: Tensor<'_>) -> bool {
+    gate.ty() == up.ty()
+        && gate.ne() == up.ne()
+        && gate.nb() == up.nb()
+        && gate.cuda_device() == up.cuda_device()
+}
+
+/// The quantization ([`quantize_geglu`]) of ggml's `geglu_split(gate @ x, up @ x)` over `n`
+/// columns already quantized in `xq` (as [`mul_mat_q`] reads them), as one node: the gate and
+/// up matmuls in one kernel whose epilogue writes the GeGLU's quantization, the bytes of
+/// `quantize_geglu(mul_mat_q(gate, xq, n), mul_mat_q(up, xq, n))` without the two F32 outputs.
+/// Read by [`mul_mat_q`] of the down weight. Where [`takes`] takes `gate` and `up` for the F32
+/// `[k, n]` columns and [`geglu_pair_fits`] holds.
+pub fn mul_mat_geglu_q<'a>(
+    ctx: &'a Context,
+    gate: Tensor<'a>,
+    up: Tensor<'a>,
+    xq: Tensor<'a>,
+    n: i64,
+) -> Tensor<'a> {
+    let [k, rows, _, _] = gate.ne();
+    assert!(
+        fits((gate.ty(), gate.ne(), gate.nb()), f32_shape([k, n]))
+            && geglu_pair_fits(gate, up)
+            && xq.ty() == types::I8
+            && xq.ne()[0] as usize >= quant_bytes(k, n)
+            && quant_bytes(rows, n) <= MAX_QUANT_BYTES,
+        "q40_geglu: shapes"
+    );
+    let bytes = quant_bytes(rows, n) as i64;
+    ctx.external_with(
+        &Q40_GEGLU,
+        types::I8,
+        [bytes, 1, 1, 1],
+        &[xq, gate, up],
+        &[n as i32],
+    )
+}
+
+/// The bytes of a [`Q40_QUANT`] node of `k` x `n` values: the blocks, and with `y` (the tests')
+/// after them the F32 values it quantized (`[k, n]`).
+fn quant_node_bytes(k: i64, n: i64, y: bool) -> usize {
+    quant_bytes(k, n) + if y { (k * n) as usize * 4 } else { 0 }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quant_node<'a>(
+    ctx: &'a Context,
+    kind: i32,
+    srcs: &[Tensor<'a>],
+    k: i64,
+    n: i64,
+    eps: f32,
+    y: bool,
+) -> Tensor<'a> {
+    assert!(
+        k > 0 && k % K_STEP == 0 && n > 0 && n < 1 << 24 && quant_bytes(k, n) <= MAX_QUANT_BYTES,
+        "q40_quant: shapes"
+    );
+    let bytes = quant_node_bytes(k, n, y) as i64;
+    let params = [kind, eps.to_bits() as i32, y as i32, k as i32, n as i32];
+    ctx.external_with(&Q40_QUANT, types::I8, [bytes, 1, 1, 1], srcs, &params)
+}
+
+/// The op's quantization of the F32 `x` (`[k, n]`, as [`fits`] takes it) as its own node, for
+/// [`mul_mat_q`]: the same bytes the op's own quantization writes.
+pub fn quantize<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
+    let [k, n, _, _] = x.ne();
+    assert!(x.ty() == types::F32 && x.nb()[0] == 4, "q40_quant: x");
+    quant_node(ctx, QUANT_PLAIN, &[x], k, n, 0.0, false)
+}
+
+/// [`quantize`] of ggml's `mul(rms_norm(x, eps), w)` ([`norm_fits`]) in one pass over `x`: the
+/// bytes [`quantize`] writes for the F32 values ggml-cuda's fused norm and mul write, without
+/// those values. `y` (the tests'): the node keeps them after the blocks too.
+pub fn quantize_norm<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+    y: bool,
+) -> Tensor<'a> {
+    assert!(norm_fits(x, w), "q40_quant: norm shapes");
+    let [k, n, _, _] = x.ne();
+    quant_node(ctx, QUANT_NORM, &[x, w], k, n, eps, y)
+}
+
+/// [`quantize`] of ggml's `geglu_split(gate, up)` ([`geglu_fits`]), each value as ggml-cuda's
+/// kernel computes it, without writing them. `y` as in [`quantize_norm`].
+pub fn quantize_geglu<'a>(
+    ctx: &'a Context,
+    gate: Tensor<'a>,
+    up: Tensor<'a>,
+    y: bool,
+) -> Tensor<'a> {
+    assert!(geglu_fits(gate, up), "q40_quant: geglu shapes");
+    let [k, n, _, _] = gate.ne();
+    quant_node(ctx, QUANT_GEGLU, &[gate, up], k, n, 0.0, y)
+}
+
+/// Where the quantization (layout 1, `src/cuda/q40_mm.cu`) puts column `col`'s block `kb`: the
+/// byte of its word `w` (values 4s .. 4s + 3 of slot s, `w = 2s` for s < 4, `2(s - 4) + 1`
+/// else) among the blocks, and the index of its scale among the F32 scales after them.
+pub fn quant_at(col: usize, kb: usize, w: usize, n_pad: usize) -> (usize, usize) {
+    let tile = kb * n_pad + (col & !127);
+    let (nt, g) = ((col & 127) / 8, col % 8);
+    let word = tile * 8 + ((nt / 2 * 8 + g) * 4 + w / 2) * 4 + nt % 2 * 2 + w % 2;
+    (word * 4, tile + g / 2 * 32 + 2 * nt + g % 2)
+}
+
+/// The word of slot `s` of a block.
+fn slot_word(s: usize) -> usize {
+    if s < 4 { 2 * s } else { 2 * (s - 4) + 1 }
+}
+
+/// Writes column `col`'s quantization `(q, d)` ([`quantize_col`]) into `buf` (the blocks of
+/// `k` x `n_pad`, then the scales).
+///
+/// # Safety
+/// `buf` holds [`quant_bytes`] of `k` x (any `n` padding to `n_pad`) bytes.
+unsafe fn put_col(buf: *mut u8, k: usize, n_pad: usize, col: usize, q: &[i8], d: &[f32]) {
+    let scales = (k / QK as usize * n_pad * 32) as isize;
+    // SAFETY: the caller's: every offset is within the blocks or the scales.
+    unsafe {
+        for kb in 0..k / QK as usize {
+            for s in 0..8 {
+                let (at, sd) = quant_at(col, kb, slot_word(s), n_pad);
+                for b in 0..4 {
+                    *buf.add(at + b) = q[kb * 32 + 4 * s + b] as u8;
+                }
+                if s == 0 {
+                    *(buf.offset(scales) as *mut f32).add(sd) = d[kb];
+                }
+            }
+        }
+    }
+}
+
+/// Column `col`'s quantization `(q, d)` from `buf` (as [`put_col`] writes it).
+pub fn get_col(buf: &[u8], k: usize, n_pad: usize, col: usize) -> (Vec<i8>, Vec<f32>) {
+    let scales = k / QK as usize * n_pad * 32;
+    let mut q = vec![0i8; k];
+    let mut d = vec![0f32; k / QK as usize];
+    for kb in 0..k / QK as usize {
+        for s in 0..8 {
+            let (at, sd) = quant_at(col, kb, slot_word(s), n_pad);
+            for b in 0..4 {
+                q[kb * 32 + 4 * s + b] = buf[at + b] as i8;
+            }
+            if s == 0 {
+                let o = scales + sd * 4;
+                d[kb] = f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+            }
+        }
+    }
+    (q, d)
+}
+
+/// ggml's tanh GELU (a reference: not necessarily ggml's bits on the CPU).
+fn gelu_ref(x: f32) -> f32 {
+    0.5 * x * (1.0 + (0.797_884_6 * x * (1.0 + 0.044715 * x * x)).tanh())
+}
+
+unsafe fn cpu_q40_quant(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    let p = crate::ggml::external_params(dst);
+    let (kind, eps, y, k, n) = (
+        p[0],
+        f32::from_bits(p[1] as u32),
+        p[2] != 0,
+        p[3] as usize,
+        p[4] as usize,
+    );
+    let n_pad = n_padded(n as i64) as usize;
+    let out = dst.data as *mut u8;
+    // SAFETY: a node made by `quant_node`: host tensors of the shapes it checked.
+    unsafe {
+        let col_of = |t: *const ffi::ggml_tensor, c: usize| {
+            let t = &*t;
+            std::slice::from_raw_parts((t.data as *const u8).add(c * t.nb[1]) as *const f32, k)
+        };
+        for c in (ith..n).step_by(nth) {
+            let x = col_of(dst.src[0], c);
+            let v: Vec<f32> = match kind {
+                QUANT_NORM => {
+                    let w = std::slice::from_raw_parts((*dst.src[1]).data as *const f32, k);
+                    let ss = x.iter().fold(0f32, |s, v| v.mul_add(*v, s));
+                    let scale = 1.0 / (ss / k as f32 + eps).sqrt();
+                    x.iter().zip(w).map(|(x, w)| scale * x * w).collect()
+                }
+                QUANT_GEGLU => {
+                    let u = col_of(dst.src[1], c);
+                    x.iter().zip(u).map(|(g, u)| gelu_ref(*g) * u).collect()
+                }
+                _ => x.to_vec(),
+            };
+            if y {
+                let yo = out.add(quant_bytes(k as i64, n as i64)) as *mut f32;
+                std::ptr::copy_nonoverlapping(v.as_ptr(), yo.add(c * k), k);
+            }
+            let (q, d) = quantize_col(&v);
+            put_col(out, k, n_pad, c, &q, &d);
+        }
+    }
+}
+
+/// The GeGLU pair on the CPU: per column, the gate and up products ([`row_dot`], as
+/// [`cpu_q40_mm`] over a quantized input), the GeGLU as [`cpu_q40_quant`]'s, its quantization.
+unsafe fn cpu_q40_geglu(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    let n = crate::ggml::external_params(dst)[0] as usize;
+    // SAFETY: a node made by `mul_mat_geglu_q`, host tensors of the shapes it checked.
+    unsafe {
+        let (xq, gate, up) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
+        let (k, rows) = (gate.ne[0] as usize, gate.ne[1] as usize);
+        let blocks = k / QK as usize;
+        let xb = std::slice::from_raw_parts(xq.data as *const u8, quant_bytes(k as i64, n as i64));
+        let n_pad = n_padded(n as i64) as usize;
+        let row = |w: &ffi::ggml_tensor, r: usize| {
+            std::slice::from_raw_parts((w.data as *const u8).add(r * w.nb[1]), blocks * BLOCK_BYTES)
+        };
+        for c in (ith..n).step_by(nth) {
+            let (q, d) = get_col(xb, k, n_pad, c);
+            let v: Vec<f32> = (0..rows)
+                .map(|r| {
+                    let g = row_dot(row(gate, r), blocks, &q, &d);
+                    gelu_ref(g) * row_dot(row(up, r), blocks, &q, &d)
+                })
+                .collect();
+            let (vq, vd) = quantize_col(&v);
+            put_col(dst.data as *mut u8, rows, n_pad, c, &vq, &vd);
+        }
+    }
+}
+
 /// Whether `node` is one of the op's.
 ///
 /// # Safety
@@ -277,12 +610,23 @@ unsafe fn cpu_q40_mm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: a node made by `mul_mat`, host tensors.
     unsafe {
         let (x, w) = (&*dst.src[0], &*dst.src[1]);
-        let (k, n, rows) = (x.ne[0] as usize, x.ne[1] as usize, w.ne[1] as usize);
+        let (k, n, rows) = (w.ne[0] as usize, dst.ne[1] as usize, w.ne[1] as usize);
         let blocks = k / QK as usize;
         let out = dst.data as *mut f32;
+        // A `mul_mat_q` node's input: the blocks already.
+        let pre = x.type_ == types::I8;
+        let xq = pre.then(|| {
+            std::slice::from_raw_parts(x.data as *const u8, quant_bytes(k as i64, n as i64))
+        });
+        let n_pad = n_padded(n as i64) as usize;
         for c in (ith..n).step_by(nth) {
-            let col = (x.data as *const u8).add(c * x.nb[1]) as *const f32;
-            let (q, d) = quantize_col(std::slice::from_raw_parts(col, k));
+            let (q, d) = match xq {
+                Some(buf) => get_col(buf, k, n_pad, c),
+                None => {
+                    let col = (x.data as *const u8).add(c * x.nb[1]) as *const f32;
+                    quantize_col(std::slice::from_raw_parts(col, k))
+                }
+            };
             for r in 0..rows {
                 let row = std::slice::from_raw_parts(
                     (w.data as *const u8).add(r * w.nb[1]),
@@ -321,6 +665,25 @@ mod cuda {
         rows: i32,
         ntx: i32,
         nty: i32,
+        w2: *const c_void,
+        oq: *mut i32,
+        od: *mut f32,
+    }
+
+    /// `legion_q40_quant` of `src/cuda/q40_mm.cu`.
+    #[repr(C)]
+    struct QuantParams {
+        x: *const f32,
+        x2: *const f32,
+        y: *mut f32,
+        yq: *mut i32,
+        yd: *mut f32,
+        x_ld: i64,
+        x2_ld: i64,
+        eps: f32,
+        k: i32,
+        n: i32,
+        n_pad: i32,
     }
 
     /// `dim3`.
@@ -352,6 +715,10 @@ mod cuda {
         /// The first of `legion_q40_mm_table_len` entries.
         static legion_q40_mm_table: Kernel;
         static legion_q40_mm_table_len: c_int;
+        /// The fused quantizations: the GEGLU's, the norm's below 1024 values and from 1024.
+        static legion_q40_quant_kernels: [*const c_void; 3];
+        /// The GeGLU pair's matmul (the op's tiles, writing the quantized GeGLU).
+        static legion_q40_geglu_gemm: *const c_void;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -376,6 +743,9 @@ mod cuda {
     /// refused.
     static SMEM: [[AtomicI8; KERNELS]; DEVICES] =
         [const { [const { AtomicI8::new(0) }; KERNELS] }; DEVICES];
+
+    /// The same for the GeGLU pair's matmul.
+    static SMEM_GEGLU: [AtomicI8; DEVICES] = [const { AtomicI8::new(0) }; DEVICES];
 
     /// Matmuls in the table.
     pub(super) fn kernels() -> usize {
@@ -445,13 +815,17 @@ mod cuda {
     /// memory (a hint: the GPU may keep another split).
     fn opt_in(dev: c_int, i: usize) -> Result<(), String> {
         let k = kernel(i);
-        let slot = &SMEM[dev as usize][i];
+        opt_in_func(&SMEM[dev as usize][i], k.gemm, k.smem)
+    }
+
+    /// [`opt_in`] of the matmul `gemm` taking `smem` bytes, its state in `slot`.
+    fn opt_in_func(slot: &AtomicI8, gemm: *const c_void, smem: c_int) -> Result<(), String> {
         let mut state = slot.load(Ordering::Relaxed);
         if state == 0 {
-            // SAFETY: a matmul of the table and its shared memory size.
+            // SAFETY: a matmul of src/cuda/q40_mm.cu and its shared memory size.
             state = unsafe {
-                if cudaFuncSetAttribute(k.gemm, FUNC_ATTR_MAX_DYNAMIC_SHARED, k.smem) == 0 {
-                    if cudaFuncSetAttribute(k.gemm, FUNC_ATTR_PREFERRED_SHARED_CARVEOUT, 100) != 0 {
+                if cudaFuncSetAttribute(gemm, FUNC_ATTR_MAX_DYNAMIC_SHARED, smem) == 0 {
+                    if cudaFuncSetAttribute(gemm, FUNC_ATTR_PREFERRED_SHARED_CARVEOUT, 100) != 0 {
                         cudaGetLastError();
                     }
                     1
@@ -463,22 +837,23 @@ mod cuda {
             slot.store(state, Ordering::Relaxed);
         }
         if state < 0 {
-            return Err(format!("q40_mm: {} bytes of shared memory", k.smem));
+            return Err(format!("q40_mm: {smem} bytes of shared memory"));
         }
         Ok(())
     }
 
-    fn launch(
+    fn launch<P>(
         func: *const c_void,
         grid: Dim3,
         block: Dim3,
         shared: usize,
-        p: &mut Params,
+        p: &mut P,
         stream: *mut c_void,
     ) -> Result<(), String> {
-        let mut argv = [(p as *mut Params).cast::<c_void>()];
-        // SAFETY: a kernel of the table taking `legion_q40_mm` by value, from the launch's copy
-        // of `p`; its pointers are device memory of the stream's device.
+        let mut argv = [(p as *mut P).cast::<c_void>()];
+        // SAFETY: a kernel of src/cuda/q40_mm.cu taking its arguments struct (`Params` or
+        // `QuantParams`, the one it is launched with) by value, from the launch's copy of `p`;
+        // its pointers are device memory of the stream's device.
         match unsafe { cudaLaunchKernel(func, grid, block, argv.as_mut_ptr(), shared, stream) } {
             0 => Ok(()),
             e => Err(format!("q40_mm: CUDA error {e}")),
@@ -525,7 +900,7 @@ mod cuda {
         // stream's device, the current one.
         unsafe {
             let (x, w) = (&*dst.src[0], &*dst.src[1]);
-            let (k, n, rows) = (x.ne[0], x.ne[1], w.ne[1]);
+            let (k, n, rows) = (w.ne[0], dst.ne[1], w.ne[1]);
             if !(w.data as usize).is_multiple_of(16) {
                 return Err("q40_mm: weight not 16-byte aligned".into());
             }
@@ -533,22 +908,34 @@ mod cuda {
             if cudaGetDevice(&mut dev) != 0 || !(0..DEVICES as c_int).contains(&dev) {
                 return Err("q40_mm: no current device".into());
             }
-            let quant = quant_in(crate::ggml::current_cuda_graph(), dst);
+            // A `mul_mat_q` node: its input holds the blocks (layout 1) already.
+            let pre = x.type_ == types::I8;
+            let quant = !pre && quant_in(crate::ggml::current_cuda_graph(), dst);
             let v = variant();
             let kern = kernel(v);
+            if pre && kern.quant != kernel(0).quant {
+                return Err(format!("q40_mm: matmul {v} reads another layout"));
+            }
             let (bm, bn) = (kern.bm as i64, kern.bn as i64);
             if rows % bm != 0 {
                 return Err(format!("q40_mm: {rows} rows, tiles of {bm}"));
             }
             let (ntx, nty) = ((n + bn - 1) / bn, rows / bm);
             let n_pad = ntx * bn;
-            let s = scratch(dev, stream, (k / QK) as usize * n_pad as usize * 36)?;
             let yd_off = (k / QK) as usize * n_pad as usize * 32;
+            let base = if pre {
+                if !(x.data as usize).is_multiple_of(16) {
+                    return Err("q40_mm: quantized input not 16-byte aligned".into());
+                }
+                x.data as usize
+            } else {
+                scratch(dev, stream, (k / QK) as usize * n_pad as usize * 36)?.ptr
+            };
             let mut a = Params {
                 w: w.data as *const c_void,
                 x: x.data as *const f32,
-                yq: s.ptr as *mut i32,
-                yd: (s.ptr + yd_off) as *mut f32,
+                yq: base as *mut i32,
+                yd: (base + yd_off) as *mut f32,
                 dst: dst.data as *mut f32,
                 x_ld: (x.nb[1] / 4) as i64,
                 w_nb1: w.nb[1] as i64,
@@ -559,6 +946,9 @@ mod cuda {
                 rows: rows as i32,
                 ntx: ntx as i32,
                 nty: nty as i32,
+                w2: std::ptr::null(),
+                oq: std::ptr::null_mut(),
+                od: std::ptr::null_mut(),
             };
             if quant {
                 let quant_grid = Dim3 {
@@ -581,6 +971,149 @@ mod cuda {
                 z: 1,
             };
             launch(kern.gemm, grid, block, kern.smem as usize, &mut a, stream)
+        }
+    }
+
+    /// A [`Q40_QUANT`] node: the op's quantization (the table's first, layout 1) of its input,
+    /// or one of the fused quantizations.
+    pub(super) unsafe fn q40_quant(
+        dst: &ffi::ggml_tensor,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let p = crate::ggml::external_params(dst);
+        let (kind, eps, y, k, n) = (
+            p[0],
+            f32::from_bits(p[1] as u32),
+            p[2] != 0,
+            p[3] as i64,
+            p[4] as i64,
+        );
+        let n_pad = n_padded(n);
+        // SAFETY: a node made by `quant_node` (its shapes checked there), device tensors of
+        // the stream's device; the node holds `quant_node_bytes` bytes.
+        unsafe {
+            let base = dst.data as usize;
+            if !base.is_multiple_of(16) {
+                return Err("q40_quant: output not 16-byte aligned".into());
+            }
+            let yq = base as *mut i32;
+            let yd = (base + (k / QK) as usize * n_pad as usize * 32) as *mut f32;
+            let yo = if y {
+                (base + quant_bytes(k, n)) as *mut f32
+            } else {
+                std::ptr::null_mut()
+            };
+            let x = &*dst.src[0];
+            let wide = Dim3 {
+                x: n as u32,
+                y: (k / K_STEP) as u32,
+                z: 1,
+            };
+            let block64 = Dim3 { x: 64, y: 1, z: 1 };
+            if kind == QUANT_PLAIN {
+                let mut a = Params {
+                    w: std::ptr::null(),
+                    x: x.data as *const f32,
+                    yq,
+                    yd,
+                    dst: std::ptr::null_mut(),
+                    x_ld: (x.nb[1] / 4) as i64,
+                    w_nb1: 0,
+                    dst_ld: 0,
+                    k: k as i32,
+                    n: n as i32,
+                    n_pad: n_pad as i32,
+                    rows: 0,
+                    ntx: 0,
+                    nty: 0,
+                    w2: std::ptr::null(),
+                    oq: std::ptr::null_mut(),
+                    od: std::ptr::null_mut(),
+                };
+                return launch(kernel(0).quant, wide, block64, 0, &mut a, stream);
+            }
+            let x2 = &*dst.src[1];
+            let mut a = QuantParams {
+                x: x.data as *const f32,
+                x2: x2.data as *const f32,
+                y: yo,
+                yq,
+                yd,
+                x_ld: (x.nb[1] / 4) as i64,
+                x2_ld: (x2.nb[1] / 4) as i64,
+                eps,
+                k: k as i32,
+                n: n as i32,
+                n_pad: n_pad as i32,
+            };
+            let kernels = &*std::ptr::addr_of!(legion_q40_quant_kernels);
+            if kind == QUANT_GEGLU {
+                launch(kernels[0], wide, block64, 0, &mut a, stream)
+            } else {
+                let grid = Dim3 {
+                    x: n as u32,
+                    y: 1,
+                    z: 1,
+                };
+                let block = Dim3 { x: 256, y: 1, z: 1 };
+                let f = if k < 1024 { kernels[1] } else { kernels[2] };
+                launch(f, grid, block, 0, &mut a, stream)
+            }
+        }
+    }
+
+    /// A [`Q40_GEGLU`] node: the GeGLU pair's matmul (the op's tiles, [`TILE_ROWS`] / 2 rows
+    /// of each weight a tile) over its quantized input, writing the quantized GeGLU.
+    pub(super) unsafe fn q40_geglu(
+        dst: &ffi::ggml_tensor,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let n = crate::ggml::external_params(dst)[0] as i64;
+        // SAFETY: a node made by `mul_mat_geglu_q` (its shapes passed `fits` and
+        // `geglu_pair_fits`), device tensors of the stream's device, the current one.
+        unsafe {
+            let (xq, gate, up) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
+            let (k, rows) = (gate.ne[0], gate.ne[1]);
+            let aligned = |p: *mut c_void| (p as usize).is_multiple_of(16);
+            if !(aligned(gate.data) && aligned(up.data) && aligned(xq.data) && aligned(dst.data)) {
+                return Err("q40_geglu: operands not 16-byte aligned".into());
+            }
+            let mut dev: c_int = 0;
+            if cudaGetDevice(&mut dev) != 0 || !(0..DEVICES as c_int).contains(&dev) {
+                return Err("q40_geglu: no current device".into());
+            }
+            let hr = TILE_ROWS / 2;
+            let (ntx, nty) = ((n + TILE - 1) / TILE, rows / hr);
+            let n_pad = ntx * TILE;
+            let (xb, ob) = (xq.data as usize, dst.data as usize);
+            let mut a = Params {
+                w: gate.data as *const c_void,
+                x: std::ptr::null(),
+                yq: xb as *mut i32,
+                yd: (xb + (k / QK) as usize * n_pad as usize * 32) as *mut f32,
+                dst: std::ptr::null_mut(),
+                x_ld: 0,
+                w_nb1: gate.nb[1] as i64,
+                dst_ld: 0,
+                k: k as i32,
+                n: n as i32,
+                n_pad: n_pad as i32,
+                rows: rows as i32,
+                ntx: ntx as i32,
+                nty: nty as i32,
+                w2: up.data as *const c_void,
+                oq: ob as *mut i32,
+                od: (ob + (rows / QK) as usize * n_pad as usize * 32) as *mut f32,
+            };
+            let gemm = legion_q40_geglu_gemm;
+            opt_in_func(&SMEM_GEGLU[dev as usize], gemm, SMEM_BYTES as c_int)?;
+            let grid = Dim3 {
+                x: (ntx * nty) as u32,
+                y: 1,
+                z: 1,
+            };
+            let block = Dim3 { x: 128, y: 1, z: 1 };
+            launch(gemm, grid, block, SMEM_BYTES, &mut a, stream)
         }
     }
 }
