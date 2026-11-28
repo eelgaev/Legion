@@ -502,7 +502,10 @@ __global__ void __launch_bounds__(Q40_THREADS, 1) q40_gemm_v1(const legion_q40_m
 // (BN / WARPS_N), a STAGES-deep ring of 4 K blocks a stage, MINB CTAs an SM, raster groups of
 // GROUP row tiles (COLS 0, column tiles slowest in a group) or GROUP column tiles (COLS 1, row
 // tiles slowest).
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_>
+// SB_ K blocks a stage: 4, or 2 (a stage's weight rows 36 bytes from a 16-byte aligned window
+// 0, 4, 8 or 12 bytes before them, so 3 copies a row).
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_,
+          int SB_ = 4>
 struct q40_cfg {
     static constexpr int BM          = BM_;
     static constexpr int BN          = BN_;
@@ -515,15 +518,17 @@ struct q40_cfg {
     static constexpr int THREADS     = 32 * WARPS_M * WARPS_N;
     static constexpr int MT          = BM / WARPS_M / 16;  // m16 tiles a warp
     static constexpr int NT          = BN / WARPS_N / 8;   // n8 tiles a warp
-    static constexpr int SB          = 4;
-    static constexpr int WRS         = 20;               // words a weight row (18 + 2 of the shift)
+    static constexpr int SB          = SB_;
+    static_assert(SB == 4 || SB == 2, "4 or 2 K blocks a stage");
+    static constexpr int WCPR        = SB == 4 ? 5 : 3;  // 16-byte weight copies a row
+    static constexpr int WRS         = 4 * WCPR;         // words a weight row (SB 4: 18 + 2 of the shift)
     static constexpr int D_BL        = BN / 128 * 144;   // scale words a block: 4 rows of 32, 36 apart
     static constexpr int W_WORDS     = BM * WRS;
     static constexpr int Q_WORDS     = SB * BN * 8;
     static constexpr int D_WORDS     = SB * D_BL;
     static constexpr int STAGE_WORDS = W_WORDS + Q_WORDS + D_WORDS;
     static constexpr int SMEM        = STAGES * STAGE_WORDS * 4;
-    static constexpr int WCH         = BM * 5;           // 16-byte weight copies a stage
+    static constexpr int WCH         = BM * WCPR;        // 16-byte weight copies a stage
     static constexpr int WCPT        = (WCH + THREADS - 1) / THREADS;
     static constexpr int QCH         = SB * BN * 2;      // 16-byte quant copies a stage
     static constexpr int QCPT        = QCH / THREADS;
@@ -735,6 +740,8 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
     constexpr int HR = BM / 2;  // EPI 1: hidden rows a tile
+    constexpr int WCPR = C::WCPR;
+    static_assert(SB == 4 || UNROLL == 1, "two stages a trip: 4 blocks a stage");
     static_assert(!EPI || (C::WARPS_M == 2 && HR == 16 * MT && HR == 32), "GeGLU pair: a warp row per weight");
     extern __shared__ __align__(16) uint32_t q40_smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
@@ -755,7 +762,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     const int col0      = jt * BN;
     const int nst       = p.k / (32 * SB);
 
-    // This thread's weight copies: copy c = tid + i * THREADS is row c / 5's 16 bytes c % 5.
+    // This thread's weight copies: copy c = tid + i * THREADS is row c / WCPR's 16 bytes c % WCPR.
     const char * wg = (const char *) p.w + (long long) row0 * p.w_nb1;
     int  woff[C::WCPT];
     bool wend[C::WCPT];
@@ -764,11 +771,11 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #pragma unroll
     for (int i = 0; i < C::WCPT; i++) {
         const int c = tid + i * C::THREADS;
-        woff[i]     = (c / 5) * (int) p.w_nb1 + (c % 5) * 16;
-        wend[i]     = c % 5 == 4;
+        woff[i]     = (c / WCPR) * (int) p.w_nb1 + (c % WCPR) * 16;
+        wend[i]     = c % WCPR == WCPR - 1;
         if constexpr (EPI) {
-            const int r = c / 5;
-            wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 16;
+            const int r = c / WCPR;
+            wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % WCPR) * 16;
         }
     }
     const long long qstep = (long long) p.n_pad * 8;  // words a block
@@ -791,7 +798,10 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
             uint32_t * sw = q40_smem + slot * C::STAGE_WORDS;
             uint32_t * sq = sw + C::W_WORDS;
             uint32_t * sd = sq + C::Q_WORDS;
-            const int wo = (st >> 1) * 144 + odd * 64;
+            // The rows' 16-byte aligned window and the bytes of its last copy (SB 4: 72 bytes 0
+            // or 8 in; SB 2: 36 bytes 4 (st & 3) in).
+            const int wo   = SB == 4 ? (st >> 1) * 144 + odd * 64 : (st * 36) & ~15;
+            const int last = SB == 4 ? (odd ? 16 : 8) : 4 + 4 * (st & 3);
 #pragma unroll
             for (int i = 0; i < C::WCPT; i++) {
                 const int c = tid + i * C::THREADS;
@@ -802,7 +812,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
                     } else {
                         src = wg + (woff[i] + wo);
                     }
-                    q40_cp16z(sw + c * 4, src, wend[i] && !odd ? 8 : 16);
+                    q40_cp16z(sw + c * 4, src, wend[i] ? last : 16);
                 }
             }
             const int * qs = qg + (long long) st * (SB * qstep);
@@ -839,7 +849,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
         const uint32_t * sw = q40_smem + slot * C::STAGE_WORDS;
         const uint32_t * sq = sw + C::W_WORDS;
         const float    * sd = (const float *) (sq + C::Q_WORDS);
-        const uint32_t * sa = sw + odd * 2 + (wm * 16 * MT + g) * C::WRS;
+        const uint32_t * sa = sw + (SB == 4 ? odd * 2 : st & 3) + (wm * 16 * MT + g) * C::WRS;
         // Block 2 bp + E of the stage.
         auto block = [&](const int bp, auto ev) {
             constexpr int E = decltype(ev)::value;
@@ -1030,6 +1040,11 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 
 using q40_op  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1>;   // the op's: 4 warps of 32 x 64, 2 CTAs an SM
 using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 CTA an SM
+// Stages of 2 K blocks: a 4-deep ring (3 stages in flight, 49664 bytes) and a 3-deep one at the
+// op's tiles, a 6-deep one at 128 x 128.
+using q40_h4   = q40_cfg<64, 128, 2, 2, 4, 2, 4, 1, 2>;
+using q40_h3   = q40_cfg<64, 128, 2, 2, 3, 2, 4, 1, 2>;
+using q40_128h = q40_cfg<128, 128, 4, 2, 6, 1, 8, 0, 2>;
 
 static_assert(q40_op::SMEM == 47616, "src/model/q40_mm.rs SMEM_BYTES");
 
@@ -1058,16 +1073,14 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
     { reinterpret_cast<const void *>(&q40_quant<1, false>), reinterpret_cast<const void *>(&q40_gemm_r5<q40_op>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "round 5" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 2>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "two stages a trip" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 1>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "rolled block pairs" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 2>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no FFMA" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_h4>),
+      q40_h4::SMEM, q40_h4::THREADS, q40_h4::BM, q40_h4::BN, "2-block stages, 4 deep" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_h3>),
+      q40_h3::SMEM, q40_h3::THREADS, q40_h3::BM, q40_h3::BN, "2-block stages, 3 deep" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128h>),
+      q40_128h::SMEM, q40_128h::THREADS, q40_128h::BM, q40_128h::BN, "128 x 128, 2-block stages, 6 deep" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 3>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no loads" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 4>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no barriers" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
@@ -1083,6 +1096,8 @@ extern const void * const legion_q40_quant_kernels[3] = {
 // The GeGLU pair (src/model/q40_mm.rs, `cuda::q40_geglu`): the op's matmul over a gate and an
 // up weight, grid ntx * (rows / 32), q40_op's threads and shared memory, writing the quantized
 // GeGLU. Its arguments are a legion_q40_mm.
-extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_op, 1>);
+extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_h4, 1>);
+// Its shared memory.
+extern const int legion_q40_geglu_smem = q40_h4::SMEM;
 
 }

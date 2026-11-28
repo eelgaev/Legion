@@ -721,6 +721,8 @@ mod cuda {
         static legion_q40_quant_kernels: [*const c_void; 3];
         /// The GeGLU pair's matmul (the op's tiles, writing the quantized GeGLU).
         static legion_q40_geglu_gemm: *const c_void;
+        /// Its shared memory.
+        static legion_q40_geglu_smem: c_int;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -1108,14 +1110,15 @@ mod cuda {
                 od: (ob + (rows / QK) as usize * n_pad as usize * 32) as *mut f32,
             };
             let gemm = legion_q40_geglu_gemm;
-            opt_in_func(&SMEM_GEGLU[dev as usize], gemm, SMEM_BYTES as c_int)?;
+            let smem = legion_q40_geglu_smem;
+            opt_in_func(&SMEM_GEGLU[dev as usize], gemm, smem)?;
             let grid = Dim3 {
                 x: (ntx * nty) as u32,
                 y: 1,
                 z: 1,
             };
             let block = Dim3 { x: 128, y: 1, z: 1 };
-            launch(gemm, grid, block, SMEM_BYTES, &mut a, stream)
+            launch(gemm, grid, block, smem as usize, &mut a, stream)
         }
     }
 }
