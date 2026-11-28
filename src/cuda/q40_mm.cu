@@ -805,7 +805,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #pragma unroll
             for (int i = 0; i < C::WCPT; i++) {
                 const int c = tid + i * C::THREADS;
-                if (C::WCH % C::THREADS == 0 || c < C::WCH) {
+                if ((C::WCH % C::THREADS == 0 || c < C::WCH) && !(DIAG == 6 && st >= S - 1)) {
                     const char * src;
                     if constexpr (EPI) {
                         src = wp[i] + wo;
@@ -817,12 +817,12 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
             }
             const int * qs = qg + (long long) st * (SB * qstep);
 #pragma unroll
-            for (int i = 0; i < C::QCPT; i++) {
+            for (int i = 0; i < (DIAG == 5 && st >= S - 1 ? 0 : C::QCPT); i++) {
                 constexpr int T = C::THREADS;
                 const int bl = i * T / (2 * BN), wi = i * T % (2 * BN);
                 q40_cp16(sq + bl * BN * 8 + (wi + tid) * 4, qs + bl * qstep + wi * 4);
             }
-            if (C::DCH == C::THREADS || tid < C::DCH) {
+            if ((C::DCH == C::THREADS || tid < C::DCH) && !(DIAG == 5 && st >= S - 1)) {
                 q40_cp16(sd + ds, dg + (long long) st * (SB * p.n_pad));
             }
         }
@@ -940,7 +940,8 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     };
 
     // Stage st: wait for its copies, issue those of stage st + S - 1, multiply (DIAG 3: no
-    // copies past the first stages, DIAG 4: no waits or barriers; timing bounds, not products).
+    // copies past the first stages, DIAG 4: no waits or barriers, DIAG 5 / 6: no input / weight
+// copies past the first stages; timing bounds, not products).
     auto step = [&](auto par, const int st) {
         constexpr int PAR = decltype(par)::value;
         constexpr int NEXT = PAR < 0 ? -1 : (PAR + S - 1) & 1;
@@ -1073,14 +1074,16 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
     { reinterpret_cast<const void *>(&q40_quant<1, false>), reinterpret_cast<const void *>(&q40_gemm_r5<q40_op>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "round 5" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_h4>),
-      q40_h4::SMEM, q40_h4::THREADS, q40_h4::BM, q40_h4::BN, "2-block stages, 4 deep" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_h3>),
-      q40_h3::SMEM, q40_h3::THREADS, q40_h3::BM, q40_h3::BN, "2-block stages, 3 deep" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128h>),
-      q40_128h::SMEM, q40_128h::THREADS, q40_128h::BM, q40_128h::BN, "128 x 128, 2-block stages, 6 deep" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 3>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no loads" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 5>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no input loads" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 6>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no weight loads" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128, 0, 1, 3>),
+      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "diag 128 x 128 no loads" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128, 0, 1, 5>),
+      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "diag 128 x 128 no input loads" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
@@ -1096,8 +1099,8 @@ extern const void * const legion_q40_quant_kernels[3] = {
 // The GeGLU pair (src/model/q40_mm.rs, `cuda::q40_geglu`): the op's matmul over a gate and an
 // up weight, grid ntx * (rows / 32), q40_op's threads and shared memory, writing the quantized
 // GeGLU. Its arguments are a legion_q40_mm.
-extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_h4, 1>);
+extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_op, 1>);
 // Its shared memory.
-extern const int legion_q40_geglu_smem = q40_h4::SMEM;
+extern const int legion_q40_geglu_smem = q40_op::SMEM;
 
 }
