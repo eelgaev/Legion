@@ -143,7 +143,8 @@ static LENT_PEERS: [std::sync::atomic::AtomicU64; 64] =
 /// residual hand-off copies go GPU to GPU (#814). Peer access (`cudaDeviceEnablePeerAccess`)
 /// covers `cudaMalloc`'d memory only; a lent step buffer is mapped VRAM, which a peer reaches
 /// only with access granted on the range, so without it the hand-off failed ("cudaMemcpy:
-/// invalid argument") once a long prompt's step buffers mapped the lent slots' VRAM.
+/// invalid argument") once a long prompt's step buffers mapped the lent slots' VRAM. A step
+/// buffer that spills into host memory gets the same access.
 pub fn share_lent_steps(pairs: &[(usize, usize)]) {
     use std::sync::atomic::Ordering;
     for &(a, b) in pairs {
@@ -307,8 +308,14 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
                 b.mapped.1 = true;
             }
             lap(1);
-            let a = access(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32);
-            let r = cu(cuMemSetAccess(b.va, total, &a, 1), "cuMemSetAccess(spill)");
+            // A spilling step buffer is mapped memory too: the same peers as a lent one (#814).
+            let a: Vec<CUmemAccessDesc> = lent_access_ids(t.device, lent_peers(t.device))
+                .map(|d| access(CU_MEM_LOCATION_TYPE_DEVICE, d as i32))
+                .collect();
+            let r = cu(
+                cuMemSetAccess(b.va, total, a.as_ptr(), a.len()),
+                "cuMemSetAccess(spill)",
+            );
             lap(2);
             r
         })()
