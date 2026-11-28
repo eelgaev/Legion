@@ -166,6 +166,10 @@ pub fn default_prompt_grid(
     }
 }
 
+/// `--prompt-step-grid-fold` when none is given (#1183): a prompt's last part of this many
+/// tokens or more past the whole grid cells runs in their step ([`grid::FOLD_MIN_TOKENS`]).
+pub const PROMPT_GRID_FOLD: usize = grid::FOLD_MIN_TOKENS;
+
 /// Whether `--device cuda` runs on an integrated GPU: there is no discrete one, but an
 /// integrated one (the engine's own choice, see `layout`).
 pub fn integrated_gpu() -> bool {
@@ -1326,6 +1330,10 @@ pub struct LmConfig {
     /// part past them runs alone, as in steps of this size (`--prompt-step-grid`, [`grid`]); 0
     /// for none. See [`default_prompt_grid`].
     pub prompt_grid: usize,
+    /// On [`Self::prompt_grid`]: a prompt's last part of at least this many tokens past the
+    /// whole cells runs in their step instead of alone (`--prompt-step-grid-fold`, [`grid`]);
+    /// 0 for never. [`PROMPT_GRID_FOLD`] by default.
+    pub prompt_grid_fold: usize,
     /// With sliding-window rings: the most prompt tokens a sequence takes per step (its rings
     /// hold the window plus one step). `None`: `max_batch_tokens` on a GPU sharing memory with
     /// the host (GB10: room for the bigger rings, and whole steps prefill faster), else
@@ -1736,6 +1744,7 @@ impl LmConfig {
             prefill_chunk: PREFILL_CHUNK,
             prefill_even: false,
             prompt_grid: 0,
+            prompt_grid_fold: PROMPT_GRID_FOLD,
             ring_step: None,
             pipeline_micro: PREFILL_CHUNK,
             pipeline_prompt: PIPELINE_PROMPT,
@@ -6309,6 +6318,7 @@ impl LmEngine {
             prefill_chunk: cfg.prefill_chunk.max(1),
             prefill_even: cfg.prefill_even,
             prompt_grid: cfg.prompt_grid,
+            prompt_grid_fold: cfg.prompt_grid_fold,
             ring_step,
             image_step,
             max_ctx: cfg.ctx_size,
@@ -6716,6 +6726,8 @@ struct Worker {
     prefill_even: bool,
     /// [`LmConfig::prompt_grid`].
     prompt_grid: usize,
+    /// [`LmConfig::prompt_grid_fold`].
+    prompt_grid_fold: usize,
     /// With rings: the most prompt tokens a sequence takes per step ([`LmConfig::ring_step`]).
     ring_step: usize,
     /// The most tokens one image whose tokens see each other takes ([`largest_image`]; 0
@@ -8399,7 +8411,8 @@ impl Worker {
                 } else {
                     self.prompt_grid
                 };
-                let tokens = grid::grid_take(tokens, grid);
+                let at_end = end + tokens == s.prompt.len();
+                let tokens = grid::grid_take_folded(tokens, grid, self.prompt_grid_fold, at_end);
                 (tokens > 0).then(|| PromptNext {
                     tokens,
                     logits: if end + tokens == s.prompt.len() {
@@ -8755,11 +8768,15 @@ impl Worker {
             };
             let end = self.save_cut(seq, (seq.n_past + take).min(seq.prompt.len()));
             // `--prompt-step-grid`: whole cells of the grid, the part past them alone, so the
-            // chunk ends are those of grid-sized steps (even steps choose their own sizes).
+            // chunk ends are those of grid-sized steps (even steps choose their own sizes); a
+            // long enough last part of the prompt joins the cells' step
+            // (`--prompt-step-grid-fold`).
             let end = if self.prefill_even || tier_pass {
                 end
             } else {
-                seq.n_past + grid::grid_take(end - seq.n_past, self.prompt_grid)
+                let at_end = end == seq.prompt.len();
+                let (grid, fold) = (self.prompt_grid, self.prompt_grid_fold);
+                seq.n_past + grid::grid_take_folded(end - seq.n_past, grid, fold, at_end)
             };
             // An image whose tokens see each other runs in one step (#1217): a step stops at
             // its start, the next takes it whole, past the room when it is longer (up to the

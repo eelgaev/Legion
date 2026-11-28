@@ -1340,6 +1340,15 @@ struct EngineArgs {
     /// keeps its own step sizes.
     #[arg(long, value_name = "TOKENS")]
     prompt_step_grid: Option<usize>,
+    /// Model engine, with --prompt-step-grid: a prompt's last part past the whole grid cells
+    /// runs in their step instead of alone when it holds at least this many tokens (32,738
+    /// tokens in steps of 12,288: 12,288 + 12,288 + 8,162 instead of 12,288 + 12,288 + 4,096 +
+    /// 4,066; one step fewer). A part that long takes the same prompt kernels alone as beside
+    /// the cells, so the output stays that of grid-sized steps; keep it at or above the
+    /// shortest step the prompt kernels change at (--joined-prompt-min-tokens). Default 2048;
+    /// 0 runs every such part alone.
+    #[arg(long, value_name = "TOKENS")]
+    prompt_step_grid_fold: Option<usize>,
     /// Model engine: before taking requests, run one prompt of about this many tokens (greedy,
     /// one output token). A step larger than any before it grows its buffers: the step's compute
     /// buffer, ggml-cuda's pool and, under --tp-rank, the pinned exchange buffers (registered
@@ -2259,6 +2268,9 @@ pub async fn run(
                 prompt_grid: e.prompt_step_grid.unwrap_or_else(|| {
                     legion::engine::lm::default_prompt_grid(device, integrated, max_batch_tokens)
                 }),
+                prompt_grid_fold: e
+                    .prompt_step_grid_fold
+                    .unwrap_or(legion::engine::lm::PROMPT_GRID_FOLD),
                 ring_step: e.prefill_chunk,
                 swa_full: e.swa_full,
                 swa_ring: e.swa_ring,
