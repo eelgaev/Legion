@@ -163,7 +163,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
 |---|---|---|--:|--:|--:|--:|--:|--:|
-| Legion | [QAT UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF) | MTP ⁹ | **24-49** | **93.0** | **254.9** | **791** | **704** | 532 |
+| Legion | [QAT UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF) | MTP ⁹ | **23-49** | **93.5** | **250.5** | **1,306** | **1,122** | 738 |
 | llama.cpp b12062 | QAT UD-Q4_K_XL GGUF | MTP n=3 | 24-36 | 65.1 | 213.9 | 773 | 671 | — |
 | Legion | [NVFP4](https://huggingface.co/RedHatAI/gemma-4-31B-it-NVFP4) | DFlash 2 ¹⁰ | **22-39** | **83.9** | **252.4** | **2,041** | **1,630** | 907 |
 | vLLM 0.33.0 | NVFP4 | DFlash 2 | 18-35 | 77.5 | 244.3 | 1,795 | 1,029 | — |
@@ -254,7 +254,7 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁹ Tensor parallel over one QSFP link, with output-moving opt-in flags (see the run command). 123K was not measured
 for either engine: the prompt takes both Sparks above 80 C within a minute.
 
-Measured 2026-10-20 to 2026-11-21. Each new speed record is added here.
+Measured 2026-10-20 to 2026-11-28. Each new speed record is added here.
 
 ## Roadmap
 
