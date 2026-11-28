@@ -55,13 +55,14 @@ fn decode(b: &mut ThinkBudget, think: u32, natural: &[u32], answer: &[u32]) -> V
     let close = b.marks.close;
     let (mut kept, mut answer, mut natural) = (Vec::new(), answer.iter(), natural.iter());
     loop {
-        let model = if kept.contains(&close) {
-            answer.next().copied()
-        } else {
-            Some(natural.next().copied().unwrap_or(think))
-        };
-        let Some(t) = b.forced().or(model) else {
-            return kept;
+        // The model's token is only drawn when the budget has none to put in its place.
+        let t = match b.forced() {
+            Some(t) => t,
+            None if kept.contains(&close) => match answer.next() {
+                Some(&t) => t,
+                None => return kept,
+            },
+            None => natural.next().copied().unwrap_or(think),
         };
         b.accept(t);
         kept.push(t);
