@@ -1,4 +1,4 @@
-//! `--stable-fusions` (#472) on the CPU, through the real graphs of the tiny MoE models
+//! Stable fusions (#472, on by default) on the CPU, through the real graphs of the tiny MoE models
 //! (qwen4exp, Gemma 4, Nemotron-H): the dependency nodes it adds only move where ggml's
 //! allocator frees tensors, so every logit keeps its bits. One test, as the switch is
 //! process-wide.
@@ -23,7 +23,8 @@ fn logits_off_on(path: &std::path::Path) -> (Vec<u32>, Vec<u32>) {
     let mut run = |on: bool| {
         set_stable_fusions(on);
         let logits = model.prompt_logits_all(&mut backend, &tokens).unwrap();
-        set_stable_fusions(false);
+        // Back to the default.
+        set_stable_fusions(true);
         logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
     };
     let off = run(false);

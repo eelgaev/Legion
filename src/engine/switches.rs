@@ -15,8 +15,8 @@ pub struct Switches {
     pub gated_norm: Option<bool>,
     /// MoE layers' weighted expert sum as one op ([`crate::model::core::set_moe_combine`]).
     pub moe_combine: Option<bool>,
-    /// ggml-cuda's MoE fusions kept from depending on the memory layout
-    /// ([`crate::model::core::set_stable_fusions`]).
+    /// ggml-cuda's MoE fusions kept from depending on the memory layout (on by default,
+    /// [`crate::model::core::set_stable_fusions`]).
     pub stable_fusions: Option<bool>,
     /// Gated DeltaNet layers' prep op ([`crate::model::core::set_delta_prep`]).
     pub delta_prep: Option<bool>,
